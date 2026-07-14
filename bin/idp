@@ -1,0 +1,834 @@
+#!/usr/bin/env ruby
+
+require "bundler/inline"
+
+gemfile do
+  source "https://rubygems.org"
+
+  gem "base64", "~> 0.1"
+  gem "bcrypt", "~> 3.0"
+  gem "csv", "~> 3.0"
+  gem "erb", "~> 4.0"
+  gem "globalid", "~> 1.0"
+  gem "rack", "~> 3.0"
+  gem "rack-session", "~> 2.0"
+  gem "rackup", "~> 2.0"
+  gem "saml-kit", "1.4.0"
+  gem "warden", "~> 1.0"
+  gem "webrick", "~> 1.0"
+end
+
+lib_path = Pathname.new(__FILE__).parent.parent.join('lib').realpath.to_s
+$LOAD_PATH.unshift(lib_path) unless $LOAD_PATH.include?(lib_path)
+
+$scheme = ENV.fetch("SCHEME", "http")
+$port = ENV.fetch("PORT", 8282).to_i
+$host = ENV.fetch("HOST", "localhost:#{$port}")
+
+Warden::Manager.serialize_into_session do |user|
+  user.id
+end
+
+Warden::Manager.serialize_from_session do |id|
+  ::Authn::User.find(id)
+end
+
+Warden::Strategies.add(:password) do
+  def valid?
+    params['username'] && params['password']
+  end
+
+  def authenticate!
+    user = ::Authn::User.login(params.transform_keys(&:to_sym))
+    user.nil? ? fail!("Could not log in") : success!(user)
+  end
+end
+
+module HTTPHelpers
+  def current_user?(request)
+    request.env['warden'].authenticated?
+  end
+
+  def current_user(request)
+    request.env['warden'].user
+  end
+
+  def default_headers
+    {
+      'X-Powered-By' => 'IdP'
+    }
+  end
+
+  def http_not_found
+    [404, default_headers, []]
+  end
+
+  def http_ok(headers = {}, body = nil)
+    [200, default_headers.merge(headers), [body]]
+  end
+
+  def http_redirect_to(location)
+    [302, { 'Location' => "#{$scheme}://#{$host}#{location}" }, []]
+  end
+end
+
+module Authn
+  class User
+    include ::BCrypt
+
+    class << self
+      def all
+        @all ||= ::CSV.read(File.join(__dir__, "../db/idp/users.csv"), headers: true).map do |row|
+          new(row.to_h.transform_keys(&:to_sym))
+        end
+      end
+
+      def find(id)
+        all.find do |user|
+          user[:id] == id
+        end
+      end
+
+      def find_by
+        all.find do |user|
+          yield user
+        end
+      end
+
+      def find_by_email(email)
+        find_by do |user|
+          user[:email] == email
+        end
+      end
+
+      def find_by_username(username)
+        find_by do |user|
+          user[:username] == username
+        end
+      end
+
+      def login(params = {})
+        user = find_by_username(params[:username])
+        user&.valid_password?(params[:password]) ? user : nil
+      end
+    end
+
+    attr_reader :id
+
+    def initialize(attributes)
+      @attributes = attributes
+      @id = self[:id]
+    end
+
+    def [](attribute)
+      @attributes.fetch(attribute.to_sym)
+    end
+
+    def name_id_for(name_id_format)
+      if name_id_format == Saml::Kit::Namespaces::EMAIL_ADDRESS
+        self[:email]
+      else
+        self[:id]
+      end
+    end
+
+    def create_access_token
+      ::Authz::JWT.new(
+        sub: to_global_id.to_s,
+        auth_time: Time.now.to_i,
+        email: self[:email],
+        username: self[:username],
+      )
+    end
+
+    def create_id_token
+      ::Authz::JWT.new(sub: to_global_id.to_s)
+    end
+
+    def assertion_attributes_for(request)
+      {
+        email: self[:email],
+      }
+    end
+
+    def valid_password?(entered_password)
+      ::BCrypt::Password.new(self[:password_digest]) == entered_password
+    end
+
+    def to_global_id
+      ::GlobalID.new(
+        ::URI::GID.build(
+          app: "example",
+          model_name: "User",
+          model_id: id,
+          params: {}
+        )
+      ).to_s
+    end
+  end
+
+  class OnDemandRegistry < Saml::Kit::DefaultRegistry
+    def metadata_for(entity_id)
+      found = super(entity_id)
+      return found if found
+
+      register_url(entity_id, verify_ssl: false)
+      super(entity_id)
+    end
+  end
+
+  class SessionsController
+    include ::HTTPHelpers
+
+    def call(env)
+      request = Rack::Request.new(env)
+      case request.request_method
+      when Rack::GET
+        case request.path
+        when '/sessions/new'
+          return get_login(request)
+        end
+      when Rack::POST
+        case request.path
+        when '/sessions'
+          if (user = env['warden'].authenticate(:password))
+            path = request.params["redirect_back"] ? request.params["redirect_back"] : "/"
+            return http_redirect_to(path)
+          else
+            return http_redirect_to("/sessions/new")
+          end
+        when '/sessions/delete'
+          request.env['warden'].logout
+          return http_redirect_to('/')
+        end
+      end
+
+      http_not_found
+    end
+
+    private
+
+    def get_login(request)
+      template = <<~ERB
+      <!doctype html>
+      <html lang="en" data-theme="light">
+        <head>
+          <title>IdP</title>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta name="color-scheme" content="light dark">
+          <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+        </head>
+        <body>
+          <main class="container">
+            <nav>
+              <ul>
+                <li><strong>IdP</strong></li>
+              </ul>
+            </nav>
+
+            <form id="login-form" action="/sessions" method="post">
+              <fieldset>
+                <label>
+                  Username
+                  <input type="input" placeholder="Username" id="username" name="username" value="" />
+                </label>
+                <label>
+                  Password
+                  <input type="password" placeholder="Password" id="password" name="password" value="" />
+                </label>
+              </fieldset>
+
+              <input type="hidden" name="redirect_back" value="<%= request.params["redirect_back"] %>" />
+              <input type="submit" id="login-button" value="Login" />
+            </form>
+          </main>
+        </body>
+      </html>
+      ERB
+      html = ERB.new(template, trim_mode: '-').result(binding)
+      [200, { 'Content-Type' => "text/html" }, [html]]
+    end
+  end
+
+  class SAMLController
+    include ::HTTPHelpers
+
+    def initialize(scheme, host)
+      Saml::Kit.configure do |x|
+        x.entity_id = "#{$scheme}://#{$host}/saml/metadata.xml"
+        x.registry = OnDemandRegistry.new
+        x.logger = Logger.new("/dev/stderr")
+      end
+
+      @saml_metadata = Saml::Kit::Metadata.build do |builder|
+        builder.contact_email = 'hi@example.com'
+        builder.organization_name = "Acme, Inc"
+        builder.organization_url = "#{scheme}://#{host}"
+        builder.build_identity_provider do |x|
+          x.add_single_sign_on_service("#{scheme}://#{host}/saml/new", binding: :http_post)
+          x.name_id_formats = [Saml::Kit::Namespaces::PERSISTENT, Saml::Kit::Namespaces::EMAIL_ADDRESS]
+          x.attributes << :email
+        end
+      end
+    end
+
+    def call(env)
+      request = Rack::Request.new(env)
+      case request.request_method
+      when Rack::GET
+        case request.path
+        when "/saml/continue"
+          if current_user?(request)
+            saml_params = request.session[:saml_params]
+            return saml_post_back(request, current_user(request), saml_params)
+          else
+            return http_redirect_to("/sessions/new?redirect_back=/saml/continue")
+          end
+        when "/saml/metadata.xml"
+          return http_ok(
+            { 'Content-Type' => "application/samlmetadata+xml" },
+            saml_metadata.to_xml(pretty: true)
+          )
+        end
+      when Rack::POST
+        case request.path
+        when "/saml/new"
+          saml_params = saml_params_from(request)
+
+          if current_user?(request)
+            return saml_post_back(request, current_user(request), saml_params)
+          else
+            request.session[:saml_params] = saml_params
+            return http_redirect_to("/sessions/new?redirect_back=/saml/continue")
+          end
+        end
+      end
+
+      http_not_found
+    end
+
+    private
+
+    attr_reader :saml_metadata
+
+    def saml_post_back(request, user, saml_params)
+      saml_request = binding_for(request).deserialize(saml_params)
+
+      @builder = nil
+      url, saml_params = saml_request.response_for(
+        user,
+        binding: :http_post,
+        relay_state: saml_params[:RelayState]
+      ) { |builder| @builder = builder }
+      template = <<~ERB
+      <!doctype html>
+      <html lang="en" data-theme="light">
+        <head>
+          <title>IdP</title>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta name="color-scheme" content="light dark">
+          <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+        </head>
+        <body>
+          <main class="container">
+            <nav>
+              <ul>
+                <li><strong>IdP</strong></li>
+              </ul>
+            </nav>
+
+            <h2>Recieved SAML Request</h2>
+            <textarea readonly="readonly" disabled="disabled" cols=225 rows=8><%=- saml_request.to_xml(pretty: true) -%></textarea>
+
+            <h2>Sending SAML Response (IdP -> SP)</h2>
+            <textarea readonly="readonly" disabled="disabled" cols=225 rows=32><%=- @builder.build.to_xml(pretty: true) -%></textarea>
+            <form id="postback-form" action="<%= url %>" method="post">
+              <%- saml_params.each do |(key, value)| -%>
+                <input type="hidden" name="<%= key %>" value="<%= value %>" />
+              <%- end -%>
+              <input id="submit-button" type="submit" value="Continue" />
+            </form>
+          </main>
+        </body>
+      </html>
+      ERB
+      erb = ERB.new(template, trim_mode: '-')
+      html = erb.result(binding)
+      [200, { 'Content-Type' => "text/html" }, [html]]
+    end
+
+    def saml_params_from(request)
+      if request.post?
+        {
+          "SAMLRequest" => request.params["SAMLRequest"],
+          "RelayState" => request.params["RelayState"],
+        }
+      else
+        query_string = request.query_string
+        on = query_string.include?("&amp;") ? "&amp;" : "&"
+        Hash[query_string.split(on).map { |x| x.split("=", 2) }].symbolize_keys
+      end
+    end
+
+    def binding_for(request)
+      Saml::Kit::Bindings::HttpPost.new(location: "#{$scheme}://#{$host}/saml/new")
+    end
+  end
+end
+
+class Organization
+  class << self
+    def find(id)
+      new
+    end
+  end
+end
+
+module Authz
+  class JWT
+    class << self
+      # TODO:: validate signature
+      def decode(encoded)
+        _header, body, _signature = encoded
+          .split('.', 3)
+          .map { |x| JSON.parse(Base64.strict_decode64(x), symbolize_names: true) rescue {} }
+        new(body)
+      end
+    end
+
+    attr_reader :claims
+
+    def initialize(claims)
+      now = Time.now.to_i
+      @claims = {
+        iss: "#{$scheme}://#{$host}",
+        iat: now,
+        aud: "",
+        nbf: now,
+        jti: SecureRandom.uuid,
+        exp: now + 3600,
+      }.merge(claims)
+    end
+
+    def [](claim)
+      claims.fetch(claim)
+    end
+
+    def active?
+      now = Time.now.to_i
+      self[:nbf] <= now && now < self[:exp]
+    end
+
+    def to_jwt
+      [
+        Base64.strict_encode64(JSON.generate(alg: "none")),
+        Base64.strict_encode64(JSON.generate(claims)),
+        ""
+      ].join(".")
+    end
+  end
+
+  class AuthorizationGrant
+    class << self
+      def all
+        @all ||= []
+      end
+
+      def find_by(params)
+        case params[:grant_type]
+        when 'authorization_code'
+          authorization_code_grant(params[:code], params[:code_verifier])
+        when 'refresh_token'
+          refresh_grant(params[:refresh_token])
+        when 'client_credentials'
+          client_credentials_grant(params)
+        when 'password'
+          password_grant(params[:username], params[:password])
+        when "urn:ietf:params:oauth:grant-type:saml2-bearer" # RFC-7522
+          saml_assertion_grant(params[:assertion])
+        when 'urn:ietf:params:oauth:grant-type:jwt-bearer' # RFC7523
+          jwt_bearer_grant(params)
+        end
+      end
+
+      # TODO:: implement `code_verifier` param
+      def authorization_code_grant(code, code_verifier)
+        all.find do |grant|
+          grant.active? && grant.code == code
+        end
+      end
+
+      def refresh_grant(refresh_token)
+        raise NotImplementedError
+      end
+
+      def client_credential_grant(params)
+        raise NotImplementedError
+      end
+
+      def password_grant(username, password)
+        raise NotImplementedError
+      end
+
+      def saml_assertion_grant(encoded_saml_assertion)
+        xml = Base64.decode64(encoded_saml_assertion)
+        # TODO:: Validate signature and prevent assertion reuse
+        saml_assertion = Saml::Kit::Document.to_saml_document(xml)
+
+        user = ::Authn::User.find_by_email(saml_assertion.name_id) ||
+          ::Authn::User.find(saml_assertion.name_id)
+        new(user, saml_assertion: saml_assertion)
+      end
+
+      def jwt_bearer_grant(params)
+        raise NotImplementedError
+      end
+
+      def create!(user, params = {})
+        new(user, params).tap do |grant|
+          all << grant
+        end
+      end
+    end
+
+    attr_reader :code, :user, :params
+
+    def initialize(user, params = {})
+      @user = user
+      @params = params
+      @code = SecureRandom.uuid
+      @exchanged_at = nil
+    end
+
+    def active?
+      @exchanged_at.nil?
+    end
+
+    def inactive?
+      !active?
+    end
+
+    def create_access_token
+      raise "Invalid code" unless active?
+
+      user.create_access_token.tap do
+        @exchanged_at = Time.now
+      end
+    end
+
+    def exchange
+      {
+        access_token: create_access_token.to_jwt,
+        token_type: "Bearer",
+        issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
+        expires_in: 3600,
+        refresh_token: SecureRandom.hex(32)
+      }.tap do |body|
+        if params["scope"]&.include?("openid")
+          body[:id_token] = user.create_id_token.to_jwt
+        end
+      end
+    rescue StandardError => error
+      {
+        error: error.message,
+        error_description: error.backtrace,
+      }
+    end
+  end
+
+  class OAuthController
+    include ::HTTPHelpers
+
+    def call(env)
+      request = Rack::Request.new(env)
+
+      case request.request_method
+      when Rack::GET
+        case request.path
+        when "/oauth/authorize/continue"
+          if current_user?(request)
+            return get_authorize(request.session[:oauth_params])
+          end
+        when "/oauth/authorize" # RFC-6749
+          oauth_params = request.params.slice('client_id', 'scope', 'redirect_uri', 'response_mode', 'response_type', 'state', 'code_challenge_method', 'code_challenge')
+          if current_user?(request)
+            return get_authorize(oauth_params)
+          else
+            request.session[:oauth_params] = oauth_params
+            return http_redirect_to("/sessions/new?redirect_back=/oauth/authorize/continue")
+          end
+        else
+          return http_not_found
+        end
+      when Rack::POST
+        case request.path
+        when "/oauth/authorize" # RFC-6749
+          return post_authorize(request)
+        when "/oauth/introspect" # RFC-7662
+          params = request.content_type == "application/json" ? JSON.parse(request.body.read, symbolize_names: true) : Hash[URI.decode_www_form(request.body.read)].transform_keys(&:to_sym)
+          return post_introspect(params.slice(:token, :token_type_hint))
+        when "/oauth/token" # RFC-6749
+          params = request.content_type == "application/json" ? JSON.parse(request.body.read, symbolize_names: true) : Hash[URI.decode_www_form(request.body.read)].transform_keys(&:to_sym)
+          grant = AuthorizationGrant.find_by(params)
+
+          return [404, { "Content-Type" => "application/json" }, [JSON.pretty_generate(error: 404, error_description: "Not Found")]] if grant.nil? || grant.inactive?
+          return [200, { "Content-Type" => "application/json" }, [JSON.pretty_generate(grant.exchange)]]
+        when "/oauth/revoke" # RFC-7009
+          # TODO:: Revoke the JWT token and make it ineligible for usage
+          return http_not_found
+        else
+          return http_not_found
+        end
+      end
+      http_not_found
+    end
+
+    private
+
+    def post_introspect(params)
+      token = ::Authz::JWT.decode(params[:token])
+      return [200, { "Content-Type" => "application/json" }, [JSON.pretty_generate(token.claims.merge(active: token.active?))]]
+    end
+
+    def get_authorize(oauth_params)
+      template = <<~ERB
+      <!doctype html>
+      <html lang="en" data-theme="light">
+        <head>
+          <title>IdP</title>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta name="color-scheme" content="light dark">
+          <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+        </head>
+        <body>
+          <main class="container">
+            <nav>
+              <ul>
+                <li><strong>IdP</strong></li>
+              </ul>
+            </nav>
+
+            <h1>Authorize?</h1>
+            <p>Client ID: <%= oauth_params['client_id'] %></p>
+            <form id="authorize-form" action="/oauth/authorize" method="post">
+              <input type="hidden" name="client_id" value="<%= oauth_params['client_id'] %>" />
+              <input type="hidden" name="scope" value="<%= oauth_params['scope'] %>" />
+              <input type="hidden" name="redirect_uri" value="<%= oauth_params['redirect_uri'] %>" />
+              <input type="hidden" name="response_mode" value="<%= oauth_params['response_mode'] %>" />
+              <input type="hidden" name="response_type" value="<%= oauth_params['response_type'] %>" />
+              <input type="hidden" name="state" value="<%= oauth_params['state'] %>" />
+              <input type="hidden" name="code_challenge_method" value="<%= oauth_params['code_challenge_method'] %>" />
+              <input type="hidden" name="code_challenge" value="<%= oauth_params['code_challenge'] %>" />
+              <input id="submit-button" type="submit" value="Authorize" />
+            </form>
+          </main>
+        </body>
+      </html>
+      ERB
+      html = ERB.new(template, trim_mode: '-').result(binding)
+      [200, { 'Content-Type' => "text/html" }, [html]]
+    end
+
+    def post_authorize(request)
+      params = request.params.slice('client_id', 'redirect_uri', 'response_type', 'response_mode', 'state', 'code_challenge_method', 'code_challenge', 'scope')
+      grant = AuthorizationGrant.create!(current_user(request), params)
+      case params['response_type']
+      when 'code'
+        case params['response_mode']
+        when 'fragment'
+          return [302, { 'Location' => "#{params['redirect_uri']}#code=#{grant.code}&state=#{params['state']}" }, []]
+        when 'query'
+          return [302, { 'Location' => "#{params['redirect_uri']}?code=#{grant.code}&state=#{params['state']}" }, []]
+        else
+          # TODO:: form post
+        end
+      when 'token'
+        return http_not_found
+      else
+        return http_not_found
+      end
+    end
+  end
+end
+
+class IdentityProvider
+  include ::HTTPHelpers
+
+  def call(env)
+    request = Rack::Request.new(env)
+
+    case request.request_method
+    when Rack::GET
+      case request.path
+      when '/'
+        if current_user?(request)
+          return get_dashboard(request)
+        else
+          return http_redirect_to("/sessions/new")
+        end
+      when '/.well-known/openid-configuration'
+        return openid_metadata
+      when '/.well-known/oauth-authorization-server'
+        return oauth_metadata
+      when '/.well-known/webfinger' # RFC-7033
+        return http_not_found
+      else
+        return http_not_found
+      end
+    end
+    http_not_found
+  end
+
+  private
+
+  def get_dashboard(request)
+    template = <<~ERB
+      <!doctype html>
+      <html lang="en" data-theme="light">
+        <head>
+          <title>IdP</title>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta name="color-scheme" content="light dark">
+          <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+        </head>
+        <body>
+          <main class="container">
+            <nav>
+              <ul>
+                <li><strong>IdP</strong></li>
+              </ul>
+              <ul>
+                <li><a href="/">Home</a></li>
+                <li>
+                  <form action="/sessions/delete" method="post">
+                    <input type="submit" value="logout" />
+                  </form>
+                </li>
+              </ul>
+            </nav>
+
+            <h1> Hello, <%= current_user(request)[:username] %></h1>
+          </main>
+        </body>
+      </html>
+    ERB
+    erb = ERB.new(template, trim_mode: '-')
+    html = erb.result(binding)
+    [200, { 'Content-Type' => "text/html" }, [html]]
+  end
+
+  # GET /.well-known/oauth-authorization-server
+  def oauth_metadata
+    [200, { 'Content-Type' => "application/json" }, [JSON.pretty_generate({
+      issuer: "#{$scheme}://#{$host}/.well-known/oauth-authorization-server",
+      authorization_endpoint: "#{$scheme}://#{$host}/oauth/authorize",
+      token_endpoint: "#{$scheme}://#{$host}/oauth/token",
+      jwks_uri: "", # RFC-7517
+      registration_endpoint: "", # RFC-7591
+      scopes_supported: ["openid", "profile", "email"],
+      response_types_supported: ["code", "code id_token", "id_token", "token id_token"],
+      response_modes_supported: ["query", "fragment", "form_post"],
+      grant_types_supported: ["authorization_code", "implicit"], # RFC-7591
+      token_endpoint_auth_methods_supported: ["client_secret_basic"], # RFC-7591
+      token_endpoint_auth_signing_alg_values_supported: ["RS256"],
+      service_documentation: "",
+      ui_locales_supported: ["en-US"],
+      op_policy_uri: "",
+      op_tos_uri: "",
+      revocation_endpoint: "#{$scheme}://#{$host}/oauth/revoke", # RFC-7009
+      revocation_endpoint_auth_methods_supported: ["client_secret_basic"],
+      revocation_endpoint_auth_signing_alg_values_supported: ["RS256"],
+      introspection_endpoint: "#{$scheme}://#{$host}/oauth/introspect", # RFC-7662
+      introspection_endpoint_auth_methods_supported: ["client_secret_basic"],
+      introspection_endpoint_auth_signing_alg_values_supported: ["RS256"],
+      code_challenge_methods_supported: [], # RFC-7636
+    })]]
+  end
+
+  # GET /.well-known/openid-configuration
+  def openid_metadata
+    [200, { 'Content-Type' => "application/json" }, [JSON.pretty_generate({
+      issuer: "#{$scheme}://#{$host}/.well-known/oauth-authorization-server",
+      authorization_endpoint: "#{$scheme}://#{$host}/oauth/authorize",
+      token_endpoint: "#{$scheme}://#{$host}/oauth/token",
+      userinfo_endpoint: "#{$scheme}://#{$host}/oidc/user/",
+      jwks_uri: "", # RFC-7517
+      registration_endpoint: nil,
+      scopes_supported: ["openid", "profile", "email"],
+      response_types_supported: ["code", "code id_token", "id_token", "token id_token"],
+      response_modes_supported: ["query", "fragment", "form_post"],
+      grant_types_supported: ["authorization_code", "implicit"], # RFC-7591
+      acr_values_supported: [],
+      subject_types_supported: ["pairwise", "public"],
+      id_token_signing_alg_values_supported: ["RS256"],
+      id_token_encryption_alg_values_supported: [],
+      id_token_encryption_enc_values_supported: [],
+      userinfo_signing_alg_values_supported: ["RS256"],
+      userinfo_encryption_alg_values_supported: [],
+      userinfo_encryption_enc_values_supported: [],
+      request_object_signing_alg_values_supported: ["none", "RS256"],
+      request_object_encryption_alg_values_supported: [],
+      request_object_encryption_enc_values_supported: [],
+      token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic", "client_secret_jwt", "private_key_jwt"],
+      token_endpoint_auth_signing_alg_values_supported: [],
+      display_values_supported: [],
+      claim_types_supported: ["normal", "aggregated", "distributed"],
+      claims_supported: [
+        "acr",
+        "auth_time",
+        "email",
+        "email_verified",
+        "family_name",
+        "given_name",
+        "iss",
+        "locale",
+        "name",
+        "nickname",
+        "picture",
+        "profile",
+        "sub",
+        "website"
+      ],
+      service_documentation: nil,
+      claims_locales_supported: [],
+      ui_locales_supported: ["en-US"],
+      claims_parameter_supported: false,
+      request_parameter_supported: false,
+      request_uri_paramater_supported: false,
+      require_request_uri_registration: false,
+      op_policy_uri: "",
+      op_tos_uri: "",
+    })]]
+  end
+end
+
+if __FILE__ == $0
+  app = Rack::Builder.new do
+    use Rack::CommonLogger
+    use Rack::Reloader
+    use Rack::Session::Cookie, { domain: $host.split(":", 2)[0], path: "/", secret: SecureRandom.hex(64) }
+    use ::Warden::Manager do |config|
+      config.default_scope = :user
+      config.default_strategies :password
+    end
+
+    map "/oauth" do
+      run ::Authz::OAuthController.new
+    end
+
+    map "/saml" do
+      run Authn::SAMLController.new($scheme, $host)
+    end
+
+    map "/sessions" do
+      run Authn::SessionsController.new
+    end
+    run IdentityProvider.new
+  end.to_app
+
+  Rackup::Server.start(app: app, Port: $port)
+end
