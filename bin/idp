@@ -100,6 +100,13 @@ module Scim
 
       @clazz.all.select { |record| record[attribute].to_s == node.value }
     end
+
+    def visit_presence(node)
+      attribute = @mapper[node.attribute.to_s.underscore]
+      return [] if attribute.nil?
+
+      @clazz.all.select { |record| record[attribute].present? }
+    end
   end
 end
 
@@ -499,21 +506,21 @@ module Authn
       when Rack::GET
         case request.path
         when "/scim/v2/ServiceProviderConfig"
-          return [200, { "Content-Type" => "application/json" }, [configuration.service_provider_configuration.to_json]]
+          return [200, scim_headers, [configuration.service_provider_configuration.to_json]]
         when "/scim/v2/ResourceTypes"
-          return [200, { "Content-Type" => "application/json" }, [JSON.pretty_generate(configuration.resource_types.values.map(&:to_h))]]
+          return [200, scim_headers, [JSON.pretty_generate(configuration.resource_types.values.map(&:to_h))]]
         when "/scim/v2/ResourceTypes/User"
-          return [200, { "Content-Type" => "application/json" }, [configuration.resource_types["User"].to_json]]
+          return [200, scim_headers, [configuration.resource_types["User"].to_json]]
         when "/scim/v2/ResourceTypes/Group"
-          return [200, { "Content-Type" => "application/json" }, [configuration.resource_types["Group"].to_json]]
+          return [200, scim_headers, [configuration.resource_types["Group"].to_json]]
         when "/scim/v2/Schemas"
-          return [200, { "Content-Type" => "application/json" }, [JSON.pretty_generate(configuration.schemas.values.map(&:to_h))]]
+          return [200, scim_headers, [JSON.pretty_generate(configuration.schemas.values.map(&:to_h))]]
         when "/scim/v2/Users"
           return get_users(request)
         when %r{\A/scim/v2/Users/(?<id>[^/]+)\z}
           return get_user($~[:id])
         when "/scim/v2/Groups"
-          return [200, { "Content-Type" => "application/json" }, [JSON.pretty_generate({})]]
+          return [200, scim_headers, [JSON.pretty_generate({})]]
         end
       when Rack::POST
         case request.path
@@ -531,6 +538,10 @@ module Authn
       Scim::Kit::V2.configuration
     end
 
+    def scim_headers
+      { "Content-Type" => "application/scim+json" }
+    end
+
     def get_users(request)
       users = ::Authn::User.scim_search(request.params["filter"])
       list_response(users.map { |user| resource_for(user).to_h })
@@ -542,7 +553,7 @@ module Authn
       user = ::Authn::User.find(id)
       return scim_error(404, "User #{id} not found") if user.nil?
 
-      [200, { "Content-Type" => "application/json" }, [resource_for(user).to_json]]
+      [200, scim_headers, [resource_for(user).to_json]]
     end
 
     def post_users(request)
@@ -552,7 +563,7 @@ module Authn
       return scim_error(409, "User #{user_name} already exists") if ::Authn::User.find_by_username(user_name)
 
       user = ::Authn::User.create!(username: user_name, email: attributes.dig(:emails, 0, :value))
-      [201, { "Content-Type" => "application/json" }, [resource_for(user).to_json]]
+      [201, scim_headers, [resource_for(user).to_json]]
     rescue JSON::ParserError
       scim_error(400, "Invalid JSON")
     end
@@ -573,7 +584,7 @@ module Authn
         startIndex: 1,
         Resources: resources,
       }
-      [200, { "Content-Type" => "application/json" }, [JSON.pretty_generate(body)]]
+      [200, scim_headers, [JSON.pretty_generate(body)]]
     end
 
     def scim_error(status, detail)
@@ -582,7 +593,7 @@ module Authn
         status: status.to_s,
         detail: detail,
       }
-      [status, { "Content-Type" => "application/json" }, [JSON.pretty_generate(body)]]
+      [status, scim_headers, [JSON.pretty_generate(body)]]
     end
   end
 end
