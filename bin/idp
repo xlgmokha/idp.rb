@@ -102,7 +102,7 @@ module Authn
 
     class << self
       def all
-        @all ||= ::CSV.read(File.join(__dir__, "../db/idp/users.csv"), headers: true).map do |row|
+        @all ||= ::CSV.read(File.join(__dir__, "../share/idp/users.csv"), headers: true).map do |row|
           new(row.to_h.transform_keys(&:to_sym))
         end
       end
