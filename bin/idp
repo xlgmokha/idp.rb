@@ -93,6 +93,13 @@ module Scim
       @clazz = clazz
       @mapper = mapper
     end
+
+    def visit_equals(node)
+      attribute = @mapper[node.attribute.to_s.underscore]
+      return [] if attribute.nil?
+
+      @clazz.all.select { |record| record[attribute].to_s == node.value }
+    end
   end
 end
 
@@ -138,6 +145,25 @@ module Authn
 
       def scim_search(filter)
         Scim::Search.new(::Authn::User).for(filter)
+      end
+
+      def scim_mapper
+        {
+          "id" => :id,
+          "user_name" => :username,
+        }
+      end
+
+      def create!(username:, email: nil)
+        id = (all.map { |user| user.id.to_i }.max || 0) + 1
+        user = new(
+          id: id.to_s,
+          username: username,
+          email: email.to_s,
+          password_digest: ::BCrypt::Password.create(::SecureRandom.hex(16)).to_s
+        )
+        all << user
+        user
       end
     end
 
@@ -408,8 +434,10 @@ module Authn
   class SCIMController
     include ::HTTPHelpers
 
+    attr_reader :base_url
+
     def initialize(scheme, host)
-      base_url = "#{scheme}://#{host}/scim/v2"
+      @base_url = "#{scheme}://#{host}/scim/v2"
       Scim::Kit::V2.configure do |config|
         config.service_provider_configuration(location: "#{base_url}/ServiceProviderConfig") do |x|
           x.documentation_uri = "#{base_url}/doc"
@@ -481,9 +509,16 @@ module Authn
         when "/scim/v2/Schemas"
           return [200, { "Content-Type" => "application/json" }, [JSON.pretty_generate(configuration.schemas.values.map(&:to_h))]]
         when "/scim/v2/Users"
-          return [200, { "Content-Type" => "application/json" }, [JSON.pretty_generate({})]]
+          return get_users(request)
+        when %r{\A/scim/v2/Users/(?<id>[^/]+)\z}
+          return get_user($~[:id])
         when "/scim/v2/Groups"
           return [200, { "Content-Type" => "application/json" }, [JSON.pretty_generate({})]]
+        end
+      when Rack::POST
+        case request.path
+        when "/scim/v2/Users"
+          return post_users(request)
         end
       end
 
@@ -494,6 +529,60 @@ module Authn
 
     def configuration
       Scim::Kit::V2.configuration
+    end
+
+    def get_users(request)
+      users = ::Authn::User.scim_search(request.params["filter"])
+      list_response(users.map { |user| resource_for(user).to_h })
+    rescue ::Scim::Kit::Error => error
+      scim_error(400, error.message)
+    end
+
+    def get_user(id)
+      user = ::Authn::User.find(id)
+      return scim_error(404, "User #{id} not found") if user.nil?
+
+      [200, { "Content-Type" => "application/json" }, [resource_for(user).to_json]]
+    end
+
+    def post_users(request)
+      attributes = JSON.parse(request.body.read, symbolize_names: true)
+      user_name = attributes[:userName]
+      return scim_error(400, "userName is required") if user_name.blank?
+      return scim_error(409, "User #{user_name} already exists") if ::Authn::User.find_by_username(user_name)
+
+      user = ::Authn::User.create!(username: user_name, email: attributes.dig(:emails, 0, :value))
+      [201, { "Content-Type" => "application/json" }, [resource_for(user).to_json]]
+    rescue JSON::ParserError
+      scim_error(400, "Invalid JSON")
+    end
+
+    def resource_for(user)
+      ::Scim::Kit::V2::Resource.new(
+        schemas: [configuration.schemas[::Scim::Kit::V2::Schemas::USER]],
+        location: "#{@base_url}/Users/#{user.id}",
+        attributes: { id: user.id, user_name: user[:username] }
+      )
+    end
+
+    def list_response(resources)
+      body = {
+        schemas: [::Scim::Kit::V2::Messages::LIST_RESPONSE],
+        totalResults: resources.size,
+        itemsPerPage: resources.size,
+        startIndex: 1,
+        Resources: resources,
+      }
+      [200, { "Content-Type" => "application/json" }, [JSON.pretty_generate(body)]]
+    end
+
+    def scim_error(status, detail)
+      body = {
+        schemas: [::Scim::Kit::V2::Messages::ERROR],
+        status: status.to_s,
+        detail: detail,
+      }
+      [status, { "Content-Type" => "application/json" }, [JSON.pretty_generate(body)]]
     end
   end
 end
