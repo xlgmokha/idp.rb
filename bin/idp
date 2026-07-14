@@ -830,5 +830,12 @@ if __FILE__ == $0
     run IdentityProvider.new
   end.to_app
 
-  Rackup::Server.start(app: app, Port: $port)
+  options = { app: app, Port: $port }
+  if $scheme == "https"
+    require "webrick/https"
+    options[:SSLEnable] = true
+    options[:SSLCertName] = [["CN", $host.split(":", 2)[0]]]
+  end
+
+  Rackup::Server.start(**options)
 end
