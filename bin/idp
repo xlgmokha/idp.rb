@@ -825,8 +825,18 @@ if __FILE__ == $0
   options = { app: app, Port: $port }
   if $scheme == "https"
     require "webrick/https"
+
     options[:SSLEnable] = true
-    options[:SSLCertName] = [["CN", $host.split(":", 2)[0]]]
+
+    cert_path = ENV.fetch("SSL_CERT_FILE", File.join(__dir__, "../etc/ssl/localhost.pem"))
+    key_path = ENV.fetch("SSL_KEY_FILE", File.join(__dir__, "../etc/ssl/localhost-key.pem"))
+
+    if File.exist?(cert_path) && File.exist?(key_path)
+      options[:SSLCertificate] = OpenSSL::X509::Certificate.new(File.read(cert_path))
+      options[:SSLPrivateKey] = OpenSSL::PKey::RSA.new(File.read(key_path))
+    else
+      options[:SSLCertName] = [["CN", $host.split(":", 2)[0]]]
+    end
   end
 
   Rackup::Server.start(**options)
