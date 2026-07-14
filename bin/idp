@@ -378,14 +378,6 @@ module Authn
   end
 end
 
-class Organization
-  class << self
-    def find(id)
-      new
-    end
-  end
-end
-
 module Authz
   class JWT
     class << self
