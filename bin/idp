@@ -473,13 +473,13 @@ module Authn
         when "/scim/v2/ServiceProviderConfig"
           return [200, { "Content-Type" => "application/json" }, [configuration.service_provider_configuration.to_json]]
         when "/scim/v2/ResourceTypes"
-          return [200, { "Content-Type" => "application/json" }, [configuration.resource_types.values.to_json]]
+          return [200, { "Content-Type" => "application/json" }, [JSON.pretty_generate(configuration.resource_types.values.map(&:to_h))]]
         when "/scim/v2/ResourceTypes/User"
           return [200, { "Content-Type" => "application/json" }, [configuration.resource_types["User"].to_json]]
         when "/scim/v2/ResourceTypes/Group"
           return [200, { "Content-Type" => "application/json" }, [configuration.resource_types["Group"].to_json]]
         when "/scim/v2/Schemas"
-          return [200, { "Content-Type" => "application/json" }, [configuration.schemas.values.to_json]]
+          return [200, { "Content-Type" => "application/json" }, [JSON.pretty_generate(configuration.schemas.values.map(&:to_h))]]
         when "/scim/v2/Users"
           return [200, { "Content-Type" => "application/json" }, [JSON.pretty_generate({})]]
         when "/scim/v2/Groups"
