@@ -14,6 +14,7 @@ gemfile do
   gem "rack-session", "~> 2.0"
   gem "rackup", "~> 2.0"
   gem "saml-kit", "1.4.0"
+  gem "scim-kit", "0.8.0"
   gem "warden", "~> 1.0"
   gem "webrick", "~> 1.0"
 end
@@ -72,6 +73,29 @@ module HTTPHelpers
   end
 end
 
+module Scim
+  class Search
+    def initialize(clazz)
+      @clazz = clazz
+    end
+
+    def for(filter)
+      return @clazz.all if filter.blank?
+
+      ::Scim::Kit::V2::Filter
+        .parse(filter)
+        .accept(Scim::Visitor.new(@clazz, @clazz.scim_mapper))
+    end
+  end
+
+  class Visitor < Scim::Kit::V2::Filter::Visitor
+    def initialize(clazz, mapper = {})
+      @clazz = clazz
+      @mapper = mapper
+    end
+  end
+end
+
 module Authn
   class User
     include ::BCrypt
@@ -110,6 +134,10 @@ module Authn
       def login(params = {})
         user = find_by_username(params[:username])
         user&.valid_password?(params[:password]) ? user : nil
+      end
+
+      def scim_search(filter)
+        Scim::Search.new(::Authn::User).for(filter)
       end
     end
 
@@ -256,7 +284,7 @@ module Authn
 
     def initialize(scheme, host)
       Saml::Kit.configure do |x|
-        x.entity_id = "#{$scheme}://#{$host}/saml/metadata.xml"
+        x.entity_id = "#{scheme}://#{host}/saml/metadata.xml"
         x.registry = OnDemandRegistry.new
         x.logger = Logger.new("/dev/stderr")
       end
@@ -374,6 +402,98 @@ module Authn
 
     def binding_for(request)
       Saml::Kit::Bindings::HttpPost.new(location: "#{$scheme}://#{$host}/saml/new")
+    end
+  end
+
+  class SCIMController
+    include ::HTTPHelpers
+
+    def initialize(scheme, host)
+      base_url = "#{scheme}://#{host}/scim/v2"
+      Scim::Kit::V2.configure do |config|
+        config.service_provider_configuration(location: "#{base_url}/ServiceProviderConfig") do |x|
+          x.documentation_uri = "#{base_url}/doc"
+          x.add_authentication(:oauthbearertoken, primary: true)
+        end
+        config.resource_type(id: 'User', location: "#{base_url}/ResourceTypes/User") do |x|
+          x.name = 'User'
+          x.schema = Scim::Kit::V2::Schemas::USER
+          x.endpoint = "#{base_url}/Users"
+        end
+        config.resource_type(id: 'Group', location: "#{base_url}/ResourceTypes/Group") do |x|
+          x.name = 'Group'
+          x.schema = Scim::Kit::V2::Schemas::GROUP
+          x.endpoint = "#{base_url}/Groups"
+        end
+        config.schema(id: Scim::Kit::V2::Schemas::USER, name: "User", location: "#{base_url}/Schemas/#{Scim::Kit::V2::Schemas::USER}") do |schema|
+          schema.add_attribute(name: :user_name) do |x|
+            x.required = true
+            x.uniqueness = :server
+          end
+          schema.add_attribute(name: :groups) do |x|
+            x.multi_valued = true
+            x.mutability = :read_only
+            x.add_attribute(name: :value) do |y|
+              y.mutability = :read_only
+            end
+            x.add_attribute(name: '$ref', type: :reference) do |y|
+              y.reference_types = %w[User Group]
+              y.mutability = :read_only
+            end
+            x.add_attribute(name: :display) do |y|
+              y.mutability = :read_only
+            end
+          end
+        end
+        config.schema(id: Scim::Kit::V2::Schemas::GROUP, name: "Group", location: "#{base_url}/Schemas/#{Scim::Kit::V2::Schemas::GROUP}") do |schema|
+          schema.add_attribute(name: :display_name)
+          schema.add_attribute(name: :members) do |x|
+            x.multi_valued = true
+            x.add_attribute(name: :value) do |y|
+              y.mutability = :immutable
+            end
+            x.add_attribute(name: '$ref') do |y|
+              y.reference_types = %w[User Group]
+              y.mutability = :immutable
+            end
+            x.add_attribute(name: :type) do |y|
+              y.canonical_values = %w[User Group]
+              y.mutability = :immutable
+            end
+          end
+        end
+      end
+    end
+
+    def call(env)
+      request = Rack::Request.new(env)
+      case request.request_method
+      when Rack::GET
+        case request.path
+        when "/scim/v2/ServiceProviderConfig"
+          return [200, { "Content-Type" => "application/json" }, [configuration.service_provider_configuration.to_json]]
+        when "/scim/v2/ResourceTypes"
+          return [200, { "Content-Type" => "application/json" }, [configuration.resource_types.values.to_json]]
+        when "/scim/v2/ResourceTypes/User"
+          return [200, { "Content-Type" => "application/json" }, [configuration.resource_types["User"].to_json]]
+        when "/scim/v2/ResourceTypes/Group"
+          return [200, { "Content-Type" => "application/json" }, [configuration.resource_types["Group"].to_json]]
+        when "/scim/v2/Schemas"
+          return [200, { "Content-Type" => "application/json" }, [configuration.schemas.values.to_json]]
+        when "/scim/v2/Users"
+          return [200, { "Content-Type" => "application/json" }, [JSON.pretty_generate({})]]
+        when "/scim/v2/Groups"
+          return [200, { "Content-Type" => "application/json" }, [JSON.pretty_generate({})]]
+        end
+      end
+
+      http_not_found
+    end
+
+    private
+
+    def configuration
+      Scim::Kit::V2.configuration
     end
   end
 end
@@ -814,6 +934,10 @@ if __FILE__ == $0
 
     map "/saml" do
       run Authn::SAMLController.new($scheme, $host)
+    end
+
+    map "/scim" do
+      run Authn::SCIMController.new($scheme, $host)
     end
 
     map "/sessions" do
