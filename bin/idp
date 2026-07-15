@@ -84,50 +84,31 @@ module Scim
 
       ::Scim::Kit::V2::Filter
         .parse(filter)
-        .accept(Scim::Visitor.new(@clazz, @clazz.scim_mapper))
+        .accept(Scim::Visitor.new(@clazz))
     end
   end
 
   class Visitor < Scim::Kit::V2::Filter::Visitor
-    def initialize(clazz, mapper = {})
+    COMPARATORS = {
+      visit_equals: ->(value, target) { value == target },
+      visit_not_equals: ->(value, target) { value != target },
+      visit_contains: ->(value, target) { value.include?(target) },
+      visit_starts_with: ->(value, target) { value.start_with?(target) },
+      visit_ends_with: ->(value, target) { value.end_with?(target) },
+      visit_greater_than: ->(value, target) { value > target },
+      visit_greater_than_equals: ->(value, target) { value >= target },
+      visit_less_than: ->(value, target) { value < target },
+      visit_less_than_equals: ->(value, target) { value <= target },
+    }.freeze
+
+    def initialize(clazz)
       @clazz = clazz
-      @mapper = mapper
     end
 
-    def visit_equals(node)
-      select_by(node) { |value| value.to_s == node.value }
-    end
-
-    def visit_not_equals(node)
-      select_by(node) { |value| value.to_s != node.value }
-    end
-
-    def visit_contains(node)
-      select_by(node) { |value| value.to_s.include?(node.value) }
-    end
-
-    def visit_starts_with(node)
-      select_by(node) { |value| value.to_s.start_with?(node.value) }
-    end
-
-    def visit_ends_with(node)
-      select_by(node) { |value| value.to_s.end_with?(node.value) }
-    end
-
-    def visit_greater_than(node)
-      select_by(node) { |value| value.to_s > node.value }
-    end
-
-    def visit_greater_than_equals(node)
-      select_by(node) { |value| value.to_s >= node.value }
-    end
-
-    def visit_less_than(node)
-      select_by(node) { |value| value.to_s < node.value }
-    end
-
-    def visit_less_than_equals(node)
-      select_by(node) { |value| value.to_s <= node.value }
+    COMPARATORS.each do |method_name, comparator|
+      define_method(method_name) do |node|
+        select_by(node) { |value| comparator.call(value.to_s, node.value) }
+      end
     end
 
     def visit_presence(node)
@@ -145,7 +126,7 @@ module Scim
     private
 
     def select_by(node)
-      attribute = @mapper[node.attribute.to_s.underscore]
+      attribute = @clazz.scim_attribute_for(node.attribute)
       return [] if attribute.nil?
 
       @clazz.all.select { |record| yield record[attribute] }
@@ -204,6 +185,10 @@ module Authn
         }
       end
 
+      def scim_attribute_for(name)
+        scim_mapper[name.to_s.underscore]
+      end
+
       def create!(username:, email: nil)
         id = (all.map { |user| user.id.to_i }.max || 0) + 1
         user = new(
@@ -217,9 +202,8 @@ module Authn
       end
 
       def delete!(id)
-        user = find(id)
-        all.delete(user) if user
-        user
+        index = all.find_index { |user| user.id == id }
+        index && all.delete_at(index)
       end
     end
 
@@ -620,7 +604,7 @@ module Authn
     def sort_users(users, sort_by, sort_order)
       return users if sort_by.blank?
 
-      attribute = ::Authn::User.scim_mapper[sort_by.to_s.underscore]
+      attribute = ::Authn::User.scim_attribute_for(sort_by)
       return users if attribute.nil?
 
       sorted = users.sort_by { |user| user[attribute].to_s }
@@ -629,8 +613,8 @@ module Authn
 
     def paginate(users, start_index_param, count_param)
       start_index = [start_index_param.to_i, 1].max
-      page = users[(start_index - 1)..] || []
-      page = page.first([count_param.to_i, 0].max) unless count_param.nil?
+      count = count_param.nil? ? users.size : [count_param.to_i, 0].max
+      page = users.drop(start_index - 1).first(count)
 
       list_response(page.map { |user| resource_for(user).to_h }, total: users.size, start_index: start_index)
     end
