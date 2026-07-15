@@ -95,17 +95,60 @@ module Scim
     end
 
     def visit_equals(node)
-      attribute = @mapper[node.attribute.to_s.underscore]
-      return [] if attribute.nil?
+      select_by(node) { |value| value.to_s == node.value }
+    end
 
-      @clazz.all.select { |record| record[attribute].to_s == node.value }
+    def visit_not_equals(node)
+      select_by(node) { |value| value.to_s != node.value }
+    end
+
+    def visit_contains(node)
+      select_by(node) { |value| value.to_s.include?(node.value) }
+    end
+
+    def visit_starts_with(node)
+      select_by(node) { |value| value.to_s.start_with?(node.value) }
+    end
+
+    def visit_ends_with(node)
+      select_by(node) { |value| value.to_s.end_with?(node.value) }
+    end
+
+    def visit_greater_than(node)
+      select_by(node) { |value| value.to_s > node.value }
+    end
+
+    def visit_greater_than_equals(node)
+      select_by(node) { |value| value.to_s >= node.value }
+    end
+
+    def visit_less_than(node)
+      select_by(node) { |value| value.to_s < node.value }
+    end
+
+    def visit_less_than_equals(node)
+      select_by(node) { |value| value.to_s <= node.value }
     end
 
     def visit_presence(node)
+      select_by(node) { |value| value.present? }
+    end
+
+    def visit_and(node)
+      visit(node.left) & visit(node.right)
+    end
+
+    def visit_or(node)
+      visit(node.left) | visit(node.right)
+    end
+
+    private
+
+    def select_by(node)
       attribute = @mapper[node.attribute.to_s.underscore]
       return [] if attribute.nil?
 
-      @clazz.all.select { |record| record[attribute].present? }
+      @clazz.all.select { |record| yield record[attribute] }
     end
   end
 end
@@ -172,6 +215,12 @@ module Authn
         all << user
         user
       end
+
+      def delete!(id)
+        user = find(id)
+        all.delete(user) if user
+        user
+      end
     end
 
     attr_reader :id
@@ -183,6 +232,12 @@ module Authn
 
     def [](attribute)
       @attributes.fetch(attribute.to_sym)
+    end
+
+    def update!(username:, email: nil)
+      @attributes[:username] = username
+      @attributes[:email] = email.to_s
+      self
     end
 
     def name_id_for(name_id_format)
@@ -441,6 +496,8 @@ module Authn
   class SCIMController
     include ::HTTPHelpers
 
+    USER_ID_PATH = %r{\A/scim/v2/Users/(?<id>[^/]+)\z}
+
     attr_reader :base_url
 
     def initialize(scheme, host)
@@ -517,7 +574,7 @@ module Authn
           return [200, scim_headers, [JSON.pretty_generate(configuration.schemas.values.map(&:to_h))]]
         when "/scim/v2/Users"
           return get_users(request)
-        when %r{\A/scim/v2/Users/(?<id>[^/]+)\z}
+        when USER_ID_PATH
           return get_user($~[:id])
         when "/scim/v2/Groups"
           return [200, scim_headers, [JSON.pretty_generate({})]]
@@ -526,6 +583,16 @@ module Authn
         case request.path
         when "/scim/v2/Users"
           return post_users(request)
+        end
+      when Rack::PUT
+        case request.path
+        when USER_ID_PATH
+          return put_user(request, $~[:id])
+        end
+      when Rack::DELETE
+        case request.path
+        when USER_ID_PATH
+          return delete_user($~[:id])
         end
       end
 
@@ -544,28 +611,84 @@ module Authn
 
     def get_users(request)
       users = ::Authn::User.scim_search(request.params["filter"])
-      list_response(users.map { |user| resource_for(user).to_h })
+      users = sort_users(users, request.params["sortBy"], request.params["sortOrder"])
+      paginate(users, request.params["startIndex"], request.params["count"])
     rescue ::Scim::Kit::Error => error
       scim_error(400, error.message)
     end
 
+    def sort_users(users, sort_by, sort_order)
+      return users if sort_by.blank?
+
+      attribute = ::Authn::User.scim_mapper[sort_by.to_s.underscore]
+      return users if attribute.nil?
+
+      sorted = users.sort_by { |user| user[attribute].to_s }
+      sort_order == "descending" ? sorted.reverse : sorted
+    end
+
+    def paginate(users, start_index_param, count_param)
+      start_index = [start_index_param.to_i, 1].max
+      page = users[(start_index - 1)..] || []
+      page = page.first([count_param.to_i, 0].max) unless count_param.nil?
+
+      list_response(page.map { |user| resource_for(user).to_h }, total: users.size, start_index: start_index)
+    end
+
     def get_user(id)
-      user = ::Authn::User.find(id)
-      return scim_error(404, "User #{id} not found") if user.nil?
+      user, error = find_user(id)
+      return error if error
 
       [200, scim_headers, [resource_for(user).to_json]]
     end
 
     def post_users(request)
-      attributes = JSON.parse(request.body.read, symbolize_names: true)
-      user_name = attributes[:userName]
+      user_name, email = params_from(request)
       return scim_error(400, "userName is required") if user_name.blank?
-      return scim_error(409, "User #{user_name} already exists") if ::Authn::User.find_by_username(user_name)
+      return scim_error(409, "User #{user_name} already exists") if username_taken?(user_name)
 
-      user = ::Authn::User.create!(username: user_name, email: attributes.dig(:emails, 0, :value))
+      user = ::Authn::User.create!(username: user_name, email: email)
       [201, scim_headers, [resource_for(user).to_json]]
     rescue JSON::ParserError
       scim_error(400, "Invalid JSON")
+    end
+
+    def put_user(request, id)
+      user, error = find_user(id)
+      return error if error
+
+      user_name, email = params_from(request)
+      return scim_error(400, "userName is required") if user_name.blank?
+      return scim_error(409, "User #{user_name} already exists") if username_taken?(user_name, except_id: user.id)
+
+      user.update!(username: user_name, email: email)
+      [200, scim_headers, [resource_for(user).to_json]]
+    rescue JSON::ParserError
+      scim_error(400, "Invalid JSON")
+    end
+
+    def delete_user(id)
+      user = ::Authn::User.delete!(id)
+      return scim_error(404, "User #{id} not found") if user.nil?
+
+      [204, {}, []]
+    end
+
+    def find_user(id)
+      user = ::Authn::User.find(id)
+      return [nil, scim_error(404, "User #{id} not found")] if user.nil?
+
+      [user, nil]
+    end
+
+    def params_from(request)
+      attributes = JSON.parse(request.body.read, symbolize_names: true)
+      [attributes[:userName], attributes.dig(:emails, 0, :value)]
+    end
+
+    def username_taken?(user_name, except_id: nil)
+      existing = ::Authn::User.find_by_username(user_name)
+      existing && existing.id != except_id
     end
 
     def resource_for(user)
@@ -576,12 +699,12 @@ module Authn
       )
     end
 
-    def list_response(resources)
+    def list_response(resources, total:, start_index:)
       body = {
         schemas: [::Scim::Kit::V2::Messages::LIST_RESPONSE],
-        totalResults: resources.size,
+        totalResults: total,
         itemsPerPage: resources.size,
-        startIndex: 1,
+        startIndex: start_index,
         Resources: resources,
       }
       [200, scim_headers, [JSON.pretty_generate(body)]]
