@@ -484,6 +484,7 @@ module Authn
     include ::HTTPHelpers
 
     USER_ID_PATH = %r{\A/scim/v2/Users/(?<id>[^/]+)\z}
+    SCHEMA_ID_PATH = %r{\A/scim/v2/Schemas/(?<id>.+)\z}
     CORE_ATTRIBUTES = %w[schemas id meta].freeze
 
     attr_reader :base_url
@@ -524,6 +525,8 @@ module Authn
           return [200, scim_headers, [configuration.resource_types["User"].to_json]]
         when "/scim/v2/Schemas"
           return [200, scim_headers, [JSON.pretty_generate(configuration.schemas.values.map(&:to_h))]]
+        when SCHEMA_ID_PATH
+          return get_schema($~[:id])
         when "/scim/v2/Users"
           return get_users(request)
         when USER_ID_PATH
@@ -585,6 +588,13 @@ module Authn
       resources = page.map { |user| select_attributes(resource_for(user).to_h, request) }
 
       list_response(resources, total: users.size, start_index: start_index)
+    end
+
+    def get_schema(id)
+      schema = configuration.schemas[id]
+      return scim_error(404, "Schema #{id} not found") if schema.nil?
+
+      [200, scim_headers, [schema.to_json]]
     end
 
     def get_user(request, id)
