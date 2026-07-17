@@ -207,11 +207,13 @@ module Authn
       end
     end
 
-    attr_reader :id
+    attr_reader :id, :created_at, :updated_at
 
     def initialize(attributes)
       @attributes = attributes
       @id = self[:id]
+      @created_at = Time.now
+      @updated_at = @created_at
     end
 
     def [](attribute)
@@ -221,6 +223,7 @@ module Authn
     def update!(username:, email: nil)
       @attributes[:username] = username
       @attributes[:email] = email.to_s
+      @updated_at = Time.now
       self
     end
 
@@ -481,6 +484,7 @@ module Authn
     include ::HTTPHelpers
 
     USER_ID_PATH = %r{\A/scim/v2/Users/(?<id>[^/]+)\z}
+    CORE_ATTRIBUTES = %w[schemas id meta].freeze
 
     attr_reader :base_url
 
@@ -490,52 +494,18 @@ module Authn
         config.service_provider_configuration(location: "#{base_url}/ServiceProviderConfig") do |x|
           x.documentation_uri = "#{base_url}/doc"
           x.add_authentication(:oauthbearertoken, primary: true)
+          x.filter.supported = true
+          x.sort.supported = true
         end
         config.resource_type(id: 'User', location: "#{base_url}/ResourceTypes/User") do |x|
           x.name = 'User'
           x.schema = Scim::Kit::V2::Schemas::USER
           x.endpoint = "#{base_url}/Users"
         end
-        config.resource_type(id: 'Group', location: "#{base_url}/ResourceTypes/Group") do |x|
-          x.name = 'Group'
-          x.schema = Scim::Kit::V2::Schemas::GROUP
-          x.endpoint = "#{base_url}/Groups"
-        end
         config.schema(id: Scim::Kit::V2::Schemas::USER, name: "User", location: "#{base_url}/Schemas/#{Scim::Kit::V2::Schemas::USER}") do |schema|
           schema.add_attribute(name: :user_name) do |x|
             x.required = true
             x.uniqueness = :server
-          end
-          schema.add_attribute(name: :groups) do |x|
-            x.multi_valued = true
-            x.mutability = :read_only
-            x.add_attribute(name: :value) do |y|
-              y.mutability = :read_only
-            end
-            x.add_attribute(name: '$ref', type: :reference) do |y|
-              y.reference_types = %w[User Group]
-              y.mutability = :read_only
-            end
-            x.add_attribute(name: :display) do |y|
-              y.mutability = :read_only
-            end
-          end
-        end
-        config.schema(id: Scim::Kit::V2::Schemas::GROUP, name: "Group", location: "#{base_url}/Schemas/#{Scim::Kit::V2::Schemas::GROUP}") do |schema|
-          schema.add_attribute(name: :display_name)
-          schema.add_attribute(name: :members) do |x|
-            x.multi_valued = true
-            x.add_attribute(name: :value) do |y|
-              y.mutability = :immutable
-            end
-            x.add_attribute(name: '$ref') do |y|
-              y.reference_types = %w[User Group]
-              y.mutability = :immutable
-            end
-            x.add_attribute(name: :type) do |y|
-              y.canonical_values = %w[User Group]
-              y.mutability = :immutable
-            end
           end
         end
       end
@@ -552,16 +522,12 @@ module Authn
           return [200, scim_headers, [JSON.pretty_generate(configuration.resource_types.values.map(&:to_h))]]
         when "/scim/v2/ResourceTypes/User"
           return [200, scim_headers, [configuration.resource_types["User"].to_json]]
-        when "/scim/v2/ResourceTypes/Group"
-          return [200, scim_headers, [configuration.resource_types["Group"].to_json]]
         when "/scim/v2/Schemas"
           return [200, scim_headers, [JSON.pretty_generate(configuration.schemas.values.map(&:to_h))]]
         when "/scim/v2/Users"
           return get_users(request)
         when USER_ID_PATH
-          return get_user($~[:id])
-        when "/scim/v2/Groups"
-          return [200, scim_headers, [JSON.pretty_generate({})]]
+          return get_user(request, $~[:id])
         end
       when Rack::POST
         case request.path
@@ -596,7 +562,7 @@ module Authn
     def get_users(request)
       users = ::Authn::User.scim_search(request.params["filter"])
       users = sort_users(users, request.params["sortBy"], request.params["sortOrder"])
-      paginate(users, request.params["startIndex"], request.params["count"])
+      paginate(users, request)
     rescue ::Scim::Kit::Error => error
       scim_error(400, error.message)
     end
@@ -611,19 +577,36 @@ module Authn
       sort_order == "descending" ? sorted.reverse : sorted
     end
 
-    def paginate(users, start_index_param, count_param)
-      start_index = [start_index_param.to_i, 1].max
+    def paginate(users, request)
+      start_index = [request.params["startIndex"].to_i, 1].max
+      count_param = request.params["count"]
       count = count_param.nil? ? users.size : [count_param.to_i, 0].max
       page = users.drop(start_index - 1).first(count)
+      resources = page.map { |user| select_attributes(resource_for(user).to_h, request) }
 
-      list_response(page.map { |user| resource_for(user).to_h }, total: users.size, start_index: start_index)
+      list_response(resources, total: users.size, start_index: start_index)
     end
 
-    def get_user(id)
+    def get_user(request, id)
       user, error = find_user(id)
       return error if error
 
-      [200, scim_headers, [resource_for(user).to_json]]
+      hash = select_attributes(resource_for(user).to_h, request)
+      [200, scim_headers, [JSON.generate(hash)]]
+    end
+
+    def select_attributes(hash, request)
+      attributes = request.params["attributes"]
+      excluded = request.params["excludedAttributes"]
+      return hash if attributes.blank? && excluded.blank?
+
+      if attributes.present?
+        keep = CORE_ATTRIBUTES + attributes.split(",").map(&:strip)
+        hash.select { |key, _| keep.include?(key.to_s) }
+      else
+        drop = excluded.split(",").map(&:strip) - CORE_ATTRIBUTES
+        hash.reject { |key, _| drop.include?(key.to_s) }
+      end
     end
 
     def post_users(request)
@@ -680,7 +663,10 @@ module Authn
         schemas: [configuration.schemas[::Scim::Kit::V2::Schemas::USER]],
         location: "#{@base_url}/Users/#{user.id}",
         attributes: { id: user.id, user_name: user[:username] }
-      )
+      ) do |resource|
+        resource.meta.created = user.created_at
+        resource.meta.last_modified = user.updated_at
+      end
     end
 
     def list_response(resources, total:, start_index:)
