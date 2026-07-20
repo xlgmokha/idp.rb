@@ -74,6 +74,28 @@ module HTTPHelpers
 end
 
 module Scim
+  COMPARATORS = {
+    eq: ->(value, target) { value == target },
+    ne: ->(value, target) { value != target },
+    co: ->(value, target) { value.include?(target) },
+    sw: ->(value, target) { value.start_with?(target) },
+    ew: ->(value, target) { value.end_with?(target) },
+    gt: ->(value, target) { value > target },
+    ge: ->(value, target) { value >= target },
+    lt: ->(value, target) { value < target },
+    le: ->(value, target) { value <= target },
+  }.freeze
+
+  class PatchError < StandardError
+    attr_reader :scim_type, :status
+
+    def initialize(message, scim_type: nil, status: 400)
+      super(message)
+      @scim_type = scim_type
+      @status = status
+    end
+  end
+
   class Search
     def initialize(clazz)
       @clazz = clazz
@@ -89,24 +111,12 @@ module Scim
   end
 
   class Visitor < Scim::Kit::V2::Filter::Visitor
-    COMPARATORS = {
-      visit_equals: ->(value, target) { value == target },
-      visit_not_equals: ->(value, target) { value != target },
-      visit_contains: ->(value, target) { value.include?(target) },
-      visit_starts_with: ->(value, target) { value.start_with?(target) },
-      visit_ends_with: ->(value, target) { value.end_with?(target) },
-      visit_greater_than: ->(value, target) { value > target },
-      visit_greater_than_equals: ->(value, target) { value >= target },
-      visit_less_than: ->(value, target) { value < target },
-      visit_less_than_equals: ->(value, target) { value <= target },
-    }.freeze
-
     def initialize(clazz)
       @clazz = clazz
     end
 
-    COMPARATORS.each do |method_name, comparator|
-      define_method(method_name) do |node|
+    COMPARATORS.each do |operator, comparator|
+      define_method(Scim::Kit::V2::Filter::Visitor::VISITORS.fetch(operator)) do |node|
         select_by(node) { |value| comparator.call(value.to_s, node.value) }
       end
     end
@@ -130,6 +140,206 @@ module Scim
       return [] if attribute.nil?
 
       @clazz.all.select { |record| yield record[attribute] }
+    end
+  end
+
+  def self.attribute_key(name)
+    name.to_s.underscore.to_sym
+  end
+
+  # Evaluates a SCIM filter expression against a plain attribute Hash. Used to
+  # resolve PATCH valuePath filters, e.g. `emails[type eq "work"]`. A second
+  # Filter::Visitor subclass alongside Scim::Visitor -- same dispatch/comparator
+  # mechanism, but reading from a plain Hash instead of scanning @clazz.all.
+  class FilterMatcher < Scim::Kit::V2::Filter::Visitor
+    def self.matches?(hash, filter_or_node)
+      node = filter_or_node.is_a?(String) ? ::Scim::Kit::V2::Filter.parse(filter_or_node) : filter_or_node
+      new(hash).visit(node)
+    end
+
+    def initialize(hash)
+      @hash = hash
+    end
+
+    COMPARATORS.each do |operator, comparator|
+      define_method(Scim::Kit::V2::Filter::Visitor::VISITORS.fetch(operator)) do |node|
+        comparator.call(@hash[Scim.attribute_key(node.attribute)].to_s, node.value)
+      end
+    end
+
+    def visit_presence(node)
+      @hash[Scim.attribute_key(node.attribute)].present?
+    end
+
+    def visit_and(node)
+      visit(node.left) && visit(node.right)
+    end
+
+    def visit_or(node)
+      visit(node.left) || visit(node.right)
+    end
+  end
+
+  # Parses a SCIM PATCH "path" (RFC 7644 3.5.2), e.g. "name.givenName",
+  # "emails", "emails[type eq \"work\"]", "emails[type eq \"work\"].value".
+  class PatchPath
+    PATTERN = %r{\A(?<attribute>[A-Za-z][\w]*)(?:\[(?<filter>.+)\])?(?:\.(?<sub_attribute>[A-Za-z][\w]*))?\z}
+
+    attr_reader :attribute, :filter, :sub_attribute
+
+    def initialize(path)
+      match = PATTERN.match(path.to_s)
+      raise ::Scim::Kit::Error, "invalid path: #{path}" if match.nil?
+
+      @attribute = Scim.attribute_key(match[:attribute])
+      @filter = match[:filter]
+      @sub_attribute = match[:sub_attribute] && Scim.attribute_key(match[:sub_attribute])
+    end
+
+    def filtered?
+      !filter.nil?
+    end
+
+    def filter_node
+      @filter_node ||= ::Scim::Kit::V2::Filter.parse(filter)
+    end
+  end
+
+  # Applies a sequence of RFC 7644 3.5.2 PATCH operations to a plain Hash
+  # representation of a User's mutable SCIM attributes, returning the
+  # resulting Hash. Operates on a deep copy so a failed operation never
+  # mutates the caller's state (PATCH requests are atomic per the RFC).
+  class PatchOp
+    MUTABLE = %i[user_name active name emails external_id].freeze
+    UNSUPPORTED = %i[password id meta schemas].freeze
+    REQUIRED = %i[user_name].freeze
+    MULTI_VALUED = %i[emails].freeze
+
+    def self.apply(state, operations)
+      patch = new(state)
+      operations.each { |operation| patch.apply_one(operation) }
+      patch.state
+    end
+
+    attr_reader :state
+
+    def initialize(state)
+      @state = state.deep_dup
+    end
+
+    def apply_one(operation)
+      case operation[:op].to_s.downcase
+      when "add" then write(operation[:path], operation[:value], replace: false)
+      when "replace" then write(operation[:path], operation[:value], replace: true)
+      when "remove" then erase(operation[:path])
+      else
+        raise ::Scim::PatchError.new("unsupported PATCH op: #{operation[:op]}", scim_type: "invalidValue")
+      end
+    end
+
+    private
+
+    def write(path, value, replace:)
+      if path.blank?
+        raise ::Scim::PatchError.new("value must be an object", scim_type: "invalidValue") unless value.is_a?(Hash)
+
+        value.each { |key, val| write(key.to_s, val, replace: replace) }
+        return
+      end
+
+      target = ::Scim::PatchPath.new(path)
+      assert_mutable!(target.attribute)
+
+      if MULTI_VALUED.include?(target.attribute)
+        write_multi_valued(target, value, replace: replace)
+      else
+        patch = target.sub_attribute ? { target.sub_attribute => value } : value
+        @state[target.attribute] = patch.is_a?(Hash) ? (@state[target.attribute] || {}).merge(underscore_keys(patch)) : patch
+      end
+    end
+
+    def erase(path)
+      raise ::Scim::PatchError.new("path is required for remove", scim_type: "noTarget") if path.blank?
+
+      target = ::Scim::PatchPath.new(path)
+      assert_mutable!(target.attribute)
+      if REQUIRED.include?(target.attribute)
+        raise ::Scim::PatchError.new("#{target.attribute} is required", scim_type: "mutability")
+      end
+
+      if MULTI_VALUED.include?(target.attribute)
+        erase_multi_valued(target)
+      elsif target.sub_attribute
+        @state[target.attribute]&.delete(target.sub_attribute)
+      else
+        @state[target.attribute] = nil
+      end
+    end
+
+    def write_multi_valued(target, value, replace:)
+      array = (@state[target.attribute] ||= [])
+
+      if target.filtered?
+        node = target.filter_node
+        array.each do |item|
+          next unless ::Scim::FilterMatcher.matches?(item, node)
+
+          if target.sub_attribute
+            item[target.sub_attribute] = value
+          elsif replace
+            item.replace(underscore_keys(value))
+          else
+            item.merge!(underscore_keys(value))
+          end
+        end
+      elsif replace
+        @state[target.attribute] = Array(value).map { |item| underscore_keys(item) }
+      else
+        additions = Array(value).map { |item| underscore_keys(item) }
+        array.concat(additions.reject { |item| array.include?(item) })
+      end
+
+      normalize_primary!(target.attribute)
+    end
+
+    def erase_multi_valued(target)
+      array = @state[target.attribute]
+      return if array.nil?
+
+      unless target.filtered?
+        @state[target.attribute] = []
+        return
+      end
+
+      node = target.filter_node
+      array.reject! { |item| ::Scim::FilterMatcher.matches?(item, node) }
+      array.each { |item| item.delete(target.sub_attribute) } if target.sub_attribute
+    end
+
+    def normalize_primary!(attribute)
+      array = @state[attribute]
+      return unless array.is_a?(Array)
+
+      primary_index = array.rindex { |item| item[:primary] == true }
+      return if primary_index.nil?
+
+      array.each_with_index do |item, index|
+        item[:primary] = false if index != primary_index && item.key?(:primary)
+      end
+    end
+
+    def underscore_keys(hash)
+      hash.transform_keys { |key| Scim.attribute_key(key) }
+    end
+
+    def assert_mutable!(attribute)
+      return if MUTABLE.include?(attribute)
+
+      if UNSUPPORTED.include?(attribute)
+        raise ::Scim::PatchError.new("#{attribute} is not mutable", scim_type: "mutability")
+      end
+
+      raise ::Scim::PatchError.new("unknown attribute: #{attribute}", scim_type: "invalidPath")
     end
   end
 end
@@ -189,7 +399,7 @@ module Authn
         scim_mapper[name.to_s.underscore]
       end
 
-      def create!(username:, email: nil, password: nil)
+      def create!(username:, email: nil, password: nil, active: true, given_name: nil, family_name: nil, emails: nil, external_id: nil)
         id = (all.map { |user| user.id.to_i }.max || 0) + 1
         user = new(
           id: id.to_s,
@@ -197,6 +407,7 @@ module Authn
           email: email.to_s,
           password_digest: ::BCrypt::Password.create(password.presence || ::SecureRandom.hex(16)).to_s
         )
+        user.assign_profile!(active: active, given_name: given_name, family_name: family_name, emails: emails, external_id: external_id)
         all << user
         user
       end
@@ -208,21 +419,61 @@ module Authn
     end
 
     attr_reader :id, :created_at, :updated_at
+    attr_accessor :active, :given_name, :family_name, :emails, :external_id
 
     def initialize(attributes)
       @attributes = attributes
       @id = self[:id]
       @created_at = Time.now
       @updated_at = @created_at
+      @active = true
+      @given_name = nil
+      @family_name = nil
+      @emails = []
+      @external_id = nil
     end
 
     def [](attribute)
       @attributes.fetch(attribute.to_sym)
     end
 
-    def update!(username:, email: nil)
+    def assign_profile!(active:, given_name:, family_name:, emails:, external_id:)
+      self.active = active.nil? ? true : active
+      self.given_name = given_name
+      self.family_name = family_name
+      self.emails = emails || []
+      self.external_id = external_id
+      self
+    end
+
+    def update!(username:, email: nil, active: true, given_name: nil, family_name: nil, emails: nil, external_id: nil)
       @attributes[:username] = username
       @attributes[:email] = email.to_s
+      assign_profile!(active: active, given_name: given_name, family_name: family_name, emails: emails, external_id: external_id)
+      @updated_at = Time.now
+      self
+    end
+
+    def scim_profile
+      {
+        user_name: self[:username],
+        active: active,
+        name: { given_name: given_name, family_name: family_name },
+        emails: emails,
+        external_id: external_id,
+      }
+    end
+
+    def apply_patch_state!(state)
+      @attributes[:username] = state[:user_name] if state.key?(:user_name)
+      self.active = state[:active] if state.key?(:active)
+      name = state[:name]
+      if name.is_a?(Hash)
+        self.given_name = name[:given_name] if name.key?(:given_name)
+        self.family_name = name[:family_name] if name.key?(:family_name)
+      end
+      self.emails = state[:emails] if state.key?(:emails)
+      self.external_id = state[:external_id] if state.key?(:external_id)
       @updated_at = Time.now
       self
     end
@@ -497,6 +748,7 @@ module Authn
           x.add_authentication(:oauthbearertoken, primary: true)
           x.filter.supported = true
           x.sort.supported = true
+          x.patch.supported = true
         end
         config.resource_type(id: 'User', location: "#{base_url}/ResourceTypes/User") do |x|
           x.name = 'User'
@@ -512,6 +764,18 @@ module Authn
             x.mutability = :write_only
             x.returned = :never
           end
+          schema.add_attribute(name: :active, type: :boolean)
+          schema.add_attribute(name: :name) do |x|
+            x.add_attribute(name: :given_name)
+            x.add_attribute(name: :family_name)
+          end
+          schema.add_attribute(name: :emails) do |x|
+            x.multi_valued = true
+            x.add_attribute(name: :value)
+            x.add_attribute(name: :type)
+            x.add_attribute(name: :primary, type: :boolean)
+          end
+          schema.add_attribute(name: :external_id)
         end
       end
     end
@@ -554,7 +818,7 @@ module Authn
       when Rack::PATCH
         case request.path
         when USER_ID_PATH
-          return scim_error(501, "PATCH is not supported")
+          return patch_user(request, $~[:id])
         end
       end
 
@@ -631,10 +895,11 @@ module Authn
     def post_users(request)
       params = params_from(request)
       return scim_error(400, "userName is required") if params[:username].blank?
-      return scim_error(409, "User #{params[:username]} already exists") if username_taken?(params[:username])
+      return scim_error(409, "User #{params[:username]} already exists", scim_type: "uniqueness") if username_taken?(params[:username])
 
       user = ::Authn::User.create!(**params)
-      [201, scim_headers, [resource_for(user).to_json]]
+      resource = resource_for(user)
+      [201, scim_headers.merge("Location" => resource.meta.location), [JSON.generate(resource.to_h)]]
     rescue JSON::ParserError
       scim_error(400, "Invalid JSON")
     end
@@ -643,14 +908,39 @@ module Authn
       user, error = find_user(id)
       return error if error
 
-      params = params_from(request)
+      params = params_from(request).except(:password)
       return scim_error(400, "userName is required") if params[:username].blank?
-      return scim_error(409, "User #{params[:username]} already exists") if username_taken?(params[:username], except_id: user.id)
+      return scim_error(409, "User #{params[:username]} already exists", scim_type: "uniqueness") if username_taken?(params[:username], except_id: user.id)
 
-      user.update!(username: params[:username], email: params[:email])
-      [200, scim_headers, [resource_for(user).to_json]]
+      user.update!(**params)
+      [200, scim_headers, [JSON.generate(resource_for(user).to_h)]]
     rescue JSON::ParserError
       scim_error(400, "Invalid JSON")
+    end
+
+    def patch_user(request, id)
+      user, error = find_user(id)
+      return error if error
+
+      body = JSON.parse(request.body.read, symbolize_names: true)
+      operations = body[:Operations]
+      return scim_error(400, "Operations is required") if operations.blank?
+
+      new_state = ::Scim::PatchOp.apply(user.scim_profile, operations)
+      new_username = new_state[:user_name]
+      if new_username != user[:username] && username_taken?(new_username, except_id: user.id)
+        return scim_error(409, "User #{new_username} already exists", scim_type: "uniqueness")
+      end
+
+      user.apply_patch_state!(new_state)
+      hash = select_attributes(resource_for(user).to_h, request)
+      [200, scim_headers, [JSON.generate(hash)]]
+    rescue JSON::ParserError
+      scim_error(400, "Invalid JSON")
+    rescue ::Scim::PatchError => error
+      scim_error(error.status, error.message, scim_type: error.scim_type)
+    rescue ::Scim::Kit::Error => error
+      scim_error(400, error.message)
     end
 
     def delete_user(id)
@@ -673,6 +963,11 @@ module Authn
         username: attributes[:userName],
         email: attributes.dig(:emails, 0, :value),
         password: attributes[:password],
+        active: attributes[:active],
+        given_name: attributes.dig(:name, :givenName),
+        family_name: attributes.dig(:name, :familyName),
+        emails: attributes[:emails],
+        external_id: attributes[:externalId],
       }
     end
 
@@ -685,7 +980,7 @@ module Authn
       ::Scim::Kit::V2::Resource.new(
         schemas: [configuration.schemas[::Scim::Kit::V2::Schemas::USER]],
         location: "#{@base_url}/Users/#{user.id}",
-        attributes: { id: user.id, user_name: user[:username] }
+        attributes: user.scim_profile.merge(id: user.id)
       ) do |resource|
         resource.meta.created = user.created_at
         resource.meta.last_modified = user.updated_at
@@ -703,12 +998,13 @@ module Authn
       [200, scim_headers, [JSON.pretty_generate(body)]]
     end
 
-    def scim_error(status, detail)
+    def scim_error(status, detail, scim_type: nil)
       body = {
         schemas: [::Scim::Kit::V2::Messages::ERROR],
         status: status.to_s,
         detail: detail,
       }
+      body[:scimType] = scim_type if scim_type
       [status, scim_headers, [JSON.pretty_generate(body)]]
     end
   end
