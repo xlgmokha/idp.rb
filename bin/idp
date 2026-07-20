@@ -189,13 +189,13 @@ module Authn
         scim_mapper[name.to_s.underscore]
       end
 
-      def create!(username:, email: nil)
+      def create!(username:, email: nil, password: nil)
         id = (all.map { |user| user.id.to_i }.max || 0) + 1
         user = new(
           id: id.to_s,
           username: username,
           email: email.to_s,
-          password_digest: ::BCrypt::Password.create(::SecureRandom.hex(16)).to_s
+          password_digest: ::BCrypt::Password.create(password || ::SecureRandom.hex(16)).to_s
         )
         all << user
         user
@@ -508,6 +508,10 @@ module Authn
             x.required = true
             x.uniqueness = :server
           end
+          schema.add_attribute(name: :password) do |x|
+            x.mutability = :write_only
+            x.returned = :never
+          end
         end
       end
     end
@@ -625,11 +629,11 @@ module Authn
     end
 
     def post_users(request)
-      user_name, email = params_from(request)
+      user_name, email, password = params_from(request)
       return scim_error(400, "userName is required") if user_name.blank?
       return scim_error(409, "User #{user_name} already exists") if username_taken?(user_name)
 
-      user = ::Authn::User.create!(username: user_name, email: email)
+      user = ::Authn::User.create!(username: user_name, email: email, password: password)
       [201, scim_headers, [resource_for(user).to_json]]
     rescue JSON::ParserError
       scim_error(400, "Invalid JSON")
@@ -665,7 +669,7 @@ module Authn
 
     def params_from(request)
       attributes = JSON.parse(request.body.read, symbolize_names: true)
-      [attributes[:userName], attributes.dig(:emails, 0, :value)]
+      [attributes[:userName], attributes.dig(:emails, 0, :value), attributes[:password]]
     end
 
     def username_taken?(user_name, except_id: nil)
