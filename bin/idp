@@ -195,7 +195,7 @@ module Authn
           id: id.to_s,
           username: username,
           email: email.to_s,
-          password_digest: ::BCrypt::Password.create(password || ::SecureRandom.hex(16)).to_s
+          password_digest: ::BCrypt::Password.create(password.presence || ::SecureRandom.hex(16)).to_s
         )
         all << user
         user
@@ -629,11 +629,11 @@ module Authn
     end
 
     def post_users(request)
-      user_name, email, password = params_from(request)
-      return scim_error(400, "userName is required") if user_name.blank?
-      return scim_error(409, "User #{user_name} already exists") if username_taken?(user_name)
+      params = params_from(request)
+      return scim_error(400, "userName is required") if params[:username].blank?
+      return scim_error(409, "User #{params[:username]} already exists") if username_taken?(params[:username])
 
-      user = ::Authn::User.create!(username: user_name, email: email, password: password)
+      user = ::Authn::User.create!(**params)
       [201, scim_headers, [resource_for(user).to_json]]
     rescue JSON::ParserError
       scim_error(400, "Invalid JSON")
@@ -643,11 +643,11 @@ module Authn
       user, error = find_user(id)
       return error if error
 
-      user_name, email = params_from(request)
-      return scim_error(400, "userName is required") if user_name.blank?
-      return scim_error(409, "User #{user_name} already exists") if username_taken?(user_name, except_id: user.id)
+      params = params_from(request)
+      return scim_error(400, "userName is required") if params[:username].blank?
+      return scim_error(409, "User #{params[:username]} already exists") if username_taken?(params[:username], except_id: user.id)
 
-      user.update!(username: user_name, email: email)
+      user.update!(username: params[:username], email: params[:email])
       [200, scim_headers, [resource_for(user).to_json]]
     rescue JSON::ParserError
       scim_error(400, "Invalid JSON")
@@ -669,7 +669,11 @@ module Authn
 
     def params_from(request)
       attributes = JSON.parse(request.body.read, symbolize_names: true)
-      [attributes[:userName], attributes.dig(:emails, 0, :value), attributes[:password]]
+      {
+        username: attributes[:userName],
+        email: attributes.dig(:emails, 0, :value),
+        password: attributes[:password],
+      }
     end
 
     def username_taken?(user_name, except_id: nil)
