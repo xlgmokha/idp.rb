@@ -501,7 +501,7 @@ module Authn
         config.resource_type(id: 'User', location: "#{base_url}/ResourceTypes/User") do |x|
           x.name = 'User'
           x.schema = Scim::Kit::V2::Schemas::USER
-          x.endpoint = "#{base_url}/Users"
+          x.endpoint = "/Users"
         end
         config.schema(id: Scim::Kit::V2::Schemas::USER, name: "User", location: "#{base_url}/Schemas/#{Scim::Kit::V2::Schemas::USER}") do |schema|
           schema.add_attribute(name: :user_name) do |x|
@@ -546,6 +546,11 @@ module Authn
         case request.path
         when USER_ID_PATH
           return delete_user($~[:id])
+        end
+      when Rack::PATCH
+        case request.path
+        when USER_ID_PATH
+          return scim_error(501, "PATCH is not supported")
         end
       end
 
