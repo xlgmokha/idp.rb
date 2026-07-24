@@ -106,17 +106,7 @@ module Scim
     def for(filter)
       return @clazz.all if filter.blank?
 
-      parse(filter).accept(Scim::Visitor.new(@clazz))
-    end
-
-    private
-
-    def parse(filter)
-      ::Scim::Kit::V2::Filter.parse(filter)
-    rescue ::Scim::Kit::Error
-      raise
-    rescue StandardError
-      raise ::Scim::Kit::Error, "invalid filter: #{filter}"
+      Scim.parse_filter(filter).accept(Scim::Visitor.new(@clazz))
     end
   end
 
@@ -157,13 +147,21 @@ module Scim
     name.to_s.underscore.to_sym
   end
 
+  def self.parse_filter(filter)
+    ::Scim::Kit::V2::Filter.parse(filter)
+  rescue ::Scim::Kit::Error
+    raise
+  rescue StandardError
+    raise ::Scim::Kit::Error, "invalid filter: #{filter}"
+  end
+
   # Evaluates a SCIM filter expression against a plain attribute Hash. Used to
   # resolve PATCH valuePath filters, e.g. `emails[type eq "work"]`. A second
   # Filter::Visitor subclass alongside Scim::Visitor -- same dispatch/comparator
   # mechanism, but reading from a plain Hash instead of scanning @clazz.all.
   class FilterMatcher < Scim::Kit::V2::Filter::Visitor
     def self.matches?(hash, filter_or_node)
-      node = filter_or_node.is_a?(String) ? ::Scim::Kit::V2::Filter.parse(filter_or_node) : filter_or_node
+      node = filter_or_node.is_a?(String) ? Scim.parse_filter(filter_or_node) : filter_or_node
       new(hash).visit(node)
     end
 
@@ -211,11 +209,7 @@ module Scim
     end
 
     def filter_node
-      @filter_node ||= ::Scim::Kit::V2::Filter.parse(filter)
-    rescue ::Scim::Kit::Error
-      raise
-    rescue StandardError
-      raise ::Scim::Kit::Error, "invalid filter: #{filter}"
+      @filter_node ||= Scim.parse_filter(filter)
     end
   end
 
@@ -234,7 +228,7 @@ module Scim
     GROUP_RULES = {
       mutable: %i[display_name members external_id],
       ignored: %i[id meta schemas],
-      unsupported: %i[],
+      unsupported: [],
       required: %i[display_name],
       multi_valued: %i[members],
     }.freeze
@@ -569,10 +563,6 @@ module Authn
 
       def find(id)
         all.find { |group| group.id == id }
-      end
-
-      def find_by
-        all.find { |group| yield group }
       end
 
       def scim_search(filter)
@@ -933,7 +923,16 @@ module Authn
     end
 
     def call(env)
-      request = Rack::Request.new(env)
+      dispatch(Rack::Request.new(env))
+    rescue JSON::ParserError
+      scim_error(400, "Invalid JSON")
+    rescue ::Scim::PatchError => error
+      scim_error(error.status, error.message, scim_type: error.scim_type)
+    rescue ::Scim::Kit::Error => error
+      scim_error(400, error.message)
+    end
+
+    def dispatch(request)
       case request.request_method
       when Rack::GET
         case request.path
@@ -975,9 +974,9 @@ module Authn
       when Rack::DELETE
         case request.path
         when USER_ID_PATH
-          return delete_user($~[:id])
+          return delete_record(::Authn::User, $~[:id], "User")
         when GROUP_ID_PATH
-          return delete_group($~[:id])
+          return delete_record(::Authn::Group, $~[:id], "Group")
         end
       when Rack::PATCH
         case request.path
@@ -1013,8 +1012,6 @@ module Authn
       records = model.scim_search(request.params["filter"])
       records = sort_records(records, model, request.params["sortBy"], request.params["sortOrder"])
       paginate(records, request, &builder)
-    rescue ::Scim::Kit::Error => error
-      scim_error(400, error.message)
     end
 
     def sort_records(records, model, sort_by, sort_order)
@@ -1045,7 +1042,7 @@ module Authn
     end
 
     def get_user(request, id)
-      user, error = find_user(id)
+      user, error = find_record(::Authn::User, id, "User")
       return error if error
 
       hash = select_attributes(user_resource_for(user).to_h, request)
@@ -1053,7 +1050,7 @@ module Authn
     end
 
     def get_group(request, id)
-      group, error = find_group(id)
+      group, error = find_record(::Authn::Group, id, "Group")
       return error if error
 
       hash = select_attributes(group_resource_for(group).to_h, request)
@@ -1082,8 +1079,6 @@ module Authn
       user = ::Authn::User.create!(**params)
       resource = user_resource_for(user)
       [201, scim_headers.merge("Location" => resource.meta.location), [JSON.generate(resource.to_h)]]
-    rescue JSON::ParserError
-      scim_error(400, "Invalid JSON")
     end
 
     def post_groups(request)
@@ -1093,12 +1088,10 @@ module Authn
       group = ::Authn::Group.create!(**params)
       resource = group_resource_for(group)
       [201, scim_headers.merge("Location" => resource.meta.location), [JSON.generate(resource.to_h)]]
-    rescue JSON::ParserError
-      scim_error(400, "Invalid JSON")
     end
 
     def put_user(request, id)
-      user, error = find_user(id)
+      user, error = find_record(::Authn::User, id, "User")
       return error if error
 
       params = params_from(request).except(:password)
@@ -1107,12 +1100,10 @@ module Authn
 
       user.update!(**params)
       [200, scim_headers, [JSON.generate(user_resource_for(user).to_h)]]
-    rescue JSON::ParserError
-      scim_error(400, "Invalid JSON")
     end
 
     def put_group(request, id)
-      group, error = find_group(id)
+      group, error = find_record(::Authn::Group, id, "Group")
       return error if error
 
       params = group_params_from(request)
@@ -1120,12 +1111,10 @@ module Authn
 
       group.update!(**params)
       [200, scim_headers, [JSON.generate(group_resource_for(group).to_h)]]
-    rescue JSON::ParserError
-      scim_error(400, "Invalid JSON")
     end
 
     def patch_user(request, id)
-      user, error = find_user(id)
+      user, error = find_record(::Authn::User, id, "User")
       return error if error
 
       body = parse_object(request)
@@ -1142,16 +1131,10 @@ module Authn
       user.apply_patch_state!(new_state)
       hash = select_attributes(user_resource_for(user).to_h, request)
       [200, scim_headers, [JSON.generate(hash)]]
-    rescue JSON::ParserError
-      scim_error(400, "Invalid JSON")
-    rescue ::Scim::PatchError => error
-      scim_error(error.status, error.message, scim_type: error.scim_type)
-    rescue ::Scim::Kit::Error => error
-      scim_error(400, error.message)
     end
 
     def patch_group(request, id)
-      group, error = find_group(id)
+      group, error = find_record(::Authn::Group, id, "Group")
       return error if error
 
       body = parse_object(request)
@@ -1164,40 +1147,20 @@ module Authn
       group.apply_patch_state!(new_state)
       hash = select_attributes(group_resource_for(group).to_h, request)
       [200, scim_headers, [JSON.generate(hash)]]
-    rescue JSON::ParserError
-      scim_error(400, "Invalid JSON")
-    rescue ::Scim::PatchError => error
-      scim_error(error.status, error.message, scim_type: error.scim_type)
-    rescue ::Scim::Kit::Error => error
-      scim_error(400, error.message)
     end
 
-    def delete_user(id)
-      user = ::Authn::User.delete!(id)
-      return scim_error(404, "User #{id} not found") if user.nil?
+    def find_record(model, id, label)
+      record = model.find(id)
+      return [nil, scim_error(404, "#{label} #{id} not found")] if record.nil?
+
+      [record, nil]
+    end
+
+    def delete_record(model, id, label)
+      record = model.delete!(id)
+      return scim_error(404, "#{label} #{id} not found") if record.nil?
 
       [204, {}, []]
-    end
-
-    def delete_group(id)
-      group = ::Authn::Group.delete!(id)
-      return scim_error(404, "Group #{id} not found") if group.nil?
-
-      [204, {}, []]
-    end
-
-    def find_user(id)
-      user = ::Authn::User.find(id)
-      return [nil, scim_error(404, "User #{id} not found")] if user.nil?
-
-      [user, nil]
-    end
-
-    def find_group(id)
-      group = ::Authn::Group.find(id)
-      return [nil, scim_error(404, "Group #{id} not found")] if group.nil?
-
-      [group, nil]
     end
 
     def parse_object(request)
@@ -1237,24 +1200,21 @@ module Authn
     end
 
     def user_resource_for(user)
-      ::Scim::Kit::V2::Resource.new(
-        schemas: [configuration.schemas[::Scim::Kit::V2::Schemas::USER]],
-        location: "#{@base_url}/Users/#{user.id}",
-        attributes: user.scim_profile.merge(id: user.id)
-      ) do |resource|
-        resource.meta.created = user.created_at
-        resource.meta.last_modified = user.updated_at
-      end
+      resource_for(user, schema: ::Scim::Kit::V2::Schemas::USER, collection: "Users")
     end
 
     def group_resource_for(group)
+      resource_for(group, schema: ::Scim::Kit::V2::Schemas::GROUP, collection: "Groups")
+    end
+
+    def resource_for(record, schema:, collection:)
       ::Scim::Kit::V2::Resource.new(
-        schemas: [configuration.schemas[::Scim::Kit::V2::Schemas::GROUP]],
-        location: "#{@base_url}/Groups/#{group.id}",
-        attributes: group.scim_profile.merge(id: group.id)
+        schemas: [configuration.schemas[schema]],
+        location: "#{@base_url}/#{collection}/#{record.id}",
+        attributes: record.scim_profile.merge(id: record.id)
       ) do |resource|
-        resource.meta.created = group.created_at
-        resource.meta.last_modified = group.updated_at
+        resource.meta.created = record.created_at
+        resource.meta.last_modified = record.updated_at
       end
     end
 
