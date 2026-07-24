@@ -210,21 +210,30 @@ module Scim
   # resulting Hash. Operates on a deep copy so a failed operation never
   # mutates the caller's state (PATCH requests are atomic per the RFC).
   class PatchOp
-    MUTABLE = %i[user_name active name emails external_id].freeze
-    UNSUPPORTED = %i[password id meta schemas].freeze
-    REQUIRED = %i[user_name].freeze
-    MULTI_VALUED = %i[emails].freeze
+    USER_RULES = {
+      mutable: %i[user_name active name emails roles external_id],
+      unsupported: %i[password id meta schemas],
+      required: %i[user_name],
+      multi_valued: %i[emails roles],
+    }.freeze
+    GROUP_RULES = {
+      mutable: %i[display_name members external_id],
+      unsupported: %i[id meta schemas],
+      required: %i[display_name],
+      multi_valued: %i[members],
+    }.freeze
 
-    def self.apply(state, operations)
-      patch = new(state)
+    def self.apply(state, operations, rules: USER_RULES)
+      patch = new(state, rules)
       operations.each { |operation| patch.apply_one(operation) }
       patch.state
     end
 
     attr_reader :state
 
-    def initialize(state)
+    def initialize(state, rules = USER_RULES)
       @state = state.deep_dup
+      @rules = rules
     end
 
     def apply_one(operation)
@@ -250,7 +259,7 @@ module Scim
       target = ::Scim::PatchPath.new(path)
       assert_mutable!(target.attribute)
 
-      if MULTI_VALUED.include?(target.attribute)
+      if @rules[:multi_valued].include?(target.attribute)
         write_multi_valued(target, value, replace: replace)
       else
         patch = target.sub_attribute ? { target.sub_attribute => value } : value
@@ -263,11 +272,11 @@ module Scim
 
       target = ::Scim::PatchPath.new(path)
       assert_mutable!(target.attribute)
-      if REQUIRED.include?(target.attribute)
+      if @rules[:required].include?(target.attribute)
         raise ::Scim::PatchError.new("#{target.attribute} is required", scim_type: "mutability")
       end
 
-      if MULTI_VALUED.include?(target.attribute)
+      if @rules[:multi_valued].include?(target.attribute)
         erase_multi_valued(target)
       elsif target.sub_attribute
         @state[target.attribute]&.delete(target.sub_attribute)
@@ -333,9 +342,9 @@ module Scim
     end
 
     def assert_mutable!(attribute)
-      return if MUTABLE.include?(attribute)
+      return if @rules[:mutable].include?(attribute)
 
-      if UNSUPPORTED.include?(attribute)
+      if @rules[:unsupported].include?(attribute)
         raise ::Scim::PatchError.new("#{attribute} is not mutable", scim_type: "mutability")
       end
 
@@ -399,7 +408,7 @@ module Authn
         scim_mapper[name.to_s.underscore]
       end
 
-      def create!(username:, email: nil, password: nil, active: true, given_name: nil, family_name: nil, emails: nil, external_id: nil)
+      def create!(username:, email: nil, password: nil, active: true, given_name: nil, family_name: nil, emails: nil, roles: nil, external_id: nil)
         id = (all.map { |user| user.id.to_i }.max || 0) + 1
         user = new(
           id: id.to_s,
@@ -407,7 +416,7 @@ module Authn
           email: email.to_s,
           password_digest: ::BCrypt::Password.create(password.presence || ::SecureRandom.hex(16)).to_s
         )
-        user.assign_profile!(active: active, given_name: given_name, family_name: family_name, emails: emails, external_id: external_id)
+        user.assign_profile!(active: active, given_name: given_name, family_name: family_name, emails: emails, roles: roles, external_id: external_id)
         all << user
         user
       end
@@ -419,7 +428,7 @@ module Authn
     end
 
     attr_reader :id, :created_at, :updated_at
-    attr_accessor :active, :given_name, :family_name, :emails, :external_id
+    attr_accessor :active, :given_name, :family_name, :emails, :roles, :external_id
 
     def initialize(attributes)
       @attributes = attributes
@@ -430,6 +439,7 @@ module Authn
       @given_name = nil
       @family_name = nil
       @emails = []
+      @roles = []
       @external_id = nil
     end
 
@@ -437,19 +447,20 @@ module Authn
       @attributes.fetch(attribute.to_sym)
     end
 
-    def assign_profile!(active:, given_name:, family_name:, emails:, external_id:)
+    def assign_profile!(active:, given_name:, family_name:, emails:, roles:, external_id:)
       self.active = active.nil? ? true : active
       self.given_name = given_name
       self.family_name = family_name
       self.emails = emails || []
+      self.roles = roles || []
       self.external_id = external_id
       self
     end
 
-    def update!(username:, email: nil, active: true, given_name: nil, family_name: nil, emails: nil, external_id: nil)
+    def update!(username:, email: nil, active: true, given_name: nil, family_name: nil, emails: nil, roles: nil, external_id: nil)
       @attributes[:username] = username
       @attributes[:email] = email.to_s
-      assign_profile!(active: active, given_name: given_name, family_name: family_name, emails: emails, external_id: external_id)
+      assign_profile!(active: active, given_name: given_name, family_name: family_name, emails: emails, roles: roles, external_id: external_id)
       @updated_at = Time.now
       self
     end
@@ -460,6 +471,7 @@ module Authn
         active: active,
         name: { given_name: given_name, family_name: family_name },
         emails: emails,
+        roles: roles,
         external_id: external_id,
       }
     end
@@ -473,6 +485,7 @@ module Authn
         self.family_name = name[:family_name] if name.key?(:family_name)
       end
       self.emails = state[:emails] if state.key?(:emails)
+      self.roles = state[:roles] if state.key?(:roles)
       self.external_id = state[:external_id] if state.key?(:external_id)
       @updated_at = Time.now
       self
@@ -518,6 +531,93 @@ module Authn
           params: {}
         )
       ).to_s
+    end
+  end
+
+  class Group
+    class << self
+      def all
+        @all ||= []
+      end
+
+      def find(id)
+        all.find { |group| group.id == id }
+      end
+
+      def find_by
+        all.find { |group| yield group }
+      end
+
+      def scim_search(filter)
+        Scim::Search.new(::Authn::Group).for(filter)
+      end
+
+      def scim_mapper
+        {
+          "id" => :id,
+          "display_name" => :display_name,
+        }
+      end
+
+      def scim_attribute_for(name)
+        scim_mapper[name.to_s.underscore]
+      end
+
+      def create!(display_name:, members: nil, external_id: nil)
+        id = (all.map { |group| group.id.to_i }.max || 0) + 1
+        group = new(id: id.to_s, display_name: display_name, members: members, external_id: external_id)
+        all << group
+        group
+      end
+
+      def delete!(id)
+        index = all.find_index { |group| group.id == id }
+        index && all.delete_at(index)
+      end
+    end
+
+    attr_reader :id, :created_at, :updated_at
+    attr_accessor :display_name, :members, :external_id
+
+    def initialize(id:, display_name:, members: nil, external_id: nil)
+      @id = id
+      @display_name = display_name
+      @members = members || []
+      @external_id = external_id
+      @created_at = Time.now
+      @updated_at = @created_at
+    end
+
+    def [](attribute)
+      case attribute.to_sym
+      when :id then id
+      when :display_name then display_name
+      when :external_id then external_id
+      end
+    end
+
+    def update!(display_name:, members: nil, external_id: nil)
+      self.display_name = display_name
+      self.members = members || []
+      self.external_id = external_id
+      @updated_at = Time.now
+      self
+    end
+
+    def scim_profile
+      {
+        display_name: display_name,
+        members: members,
+        external_id: external_id,
+      }
+    end
+
+    def apply_patch_state!(state)
+      self.display_name = state[:display_name] if state.key?(:display_name)
+      self.members = state[:members] if state.key?(:members)
+      self.external_id = state[:external_id] if state.key?(:external_id)
+      @updated_at = Time.now
+      self
     end
   end
 
@@ -735,6 +835,7 @@ module Authn
     include ::HTTPHelpers
 
     USER_ID_PATH = %r{\A/scim/v2/Users/(?<id>[^/]+)\z}
+    GROUP_ID_PATH = %r{\A/scim/v2/Groups/(?<id>[^/]+)\z}
     SCHEMA_ID_PATH = %r{\A/scim/v2/Schemas/(?<id>.+)\z}
     CORE_ATTRIBUTES = %w[schemas id meta].freeze
 
@@ -775,6 +876,30 @@ module Authn
             x.add_attribute(name: :type)
             x.add_attribute(name: :primary, type: :boolean)
           end
+          schema.add_attribute(name: :roles) do |x|
+            x.multi_valued = true
+            x.add_attribute(name: :value)
+            x.add_attribute(name: :display)
+            x.add_attribute(name: :type)
+            x.add_attribute(name: :primary, type: :boolean)
+          end
+          schema.add_attribute(name: :external_id)
+        end
+        config.resource_type(id: 'Group', location: "#{base_url}/ResourceTypes/Group") do |x|
+          x.name = 'Group'
+          x.schema = Scim::Kit::V2::Schemas::GROUP
+          x.endpoint = "/Groups"
+        end
+        config.schema(id: Scim::Kit::V2::Schemas::GROUP, name: "Group", location: "#{base_url}/Schemas/#{Scim::Kit::V2::Schemas::GROUP}") do |schema|
+          schema.add_attribute(name: :display_name) do |x|
+            x.required = true
+          end
+          schema.add_attribute(name: :members) do |x|
+            x.multi_valued = true
+            x.add_attribute(name: :value)
+            x.add_attribute(name: :display)
+            x.add_attribute(name: :type)
+          end
           schema.add_attribute(name: :external_id)
         end
       end
@@ -791,34 +916,48 @@ module Authn
           return [200, scim_headers, [JSON.pretty_generate(configuration.resource_types.values.map(&:to_h))]]
         when "/scim/v2/ResourceTypes/User"
           return [200, scim_headers, [configuration.resource_types["User"].to_json]]
+        when "/scim/v2/ResourceTypes/Group"
+          return [200, scim_headers, [configuration.resource_types["Group"].to_json]]
         when "/scim/v2/Schemas"
           return [200, scim_headers, [JSON.pretty_generate(configuration.schemas.values.map(&:to_h))]]
         when SCHEMA_ID_PATH
           return get_schema($~[:id])
         when "/scim/v2/Users"
           return get_users(request)
+        when "/scim/v2/Groups"
+          return get_groups(request)
         when USER_ID_PATH
           return get_user(request, $~[:id])
+        when GROUP_ID_PATH
+          return get_group(request, $~[:id])
         end
       when Rack::POST
         case request.path
         when "/scim/v2/Users"
           return post_users(request)
+        when "/scim/v2/Groups"
+          return post_groups(request)
         end
       when Rack::PUT
         case request.path
         when USER_ID_PATH
           return put_user(request, $~[:id])
+        when GROUP_ID_PATH
+          return put_group(request, $~[:id])
         end
       when Rack::DELETE
         case request.path
         when USER_ID_PATH
           return delete_user($~[:id])
+        when GROUP_ID_PATH
+          return delete_group($~[:id])
         end
       when Rack::PATCH
         case request.path
         when USER_ID_PATH
           return patch_user(request, $~[:id])
+        when GROUP_ID_PATH
+          return patch_group(request, $~[:id])
         end
       end
 
@@ -836,31 +975,39 @@ module Authn
     end
 
     def get_users(request)
-      users = ::Authn::User.scim_search(request.params["filter"])
-      users = sort_users(users, request.params["sortBy"], request.params["sortOrder"])
-      paginate(users, request)
+      render_collection(request, ::Authn::User) { |user| user_resource_for(user) }
+    end
+
+    def get_groups(request)
+      render_collection(request, ::Authn::Group) { |group| group_resource_for(group) }
+    end
+
+    def render_collection(request, model, &builder)
+      records = model.scim_search(request.params["filter"])
+      records = sort_records(records, model, request.params["sortBy"], request.params["sortOrder"])
+      paginate(records, request, &builder)
     rescue ::Scim::Kit::Error => error
       scim_error(400, error.message)
     end
 
-    def sort_users(users, sort_by, sort_order)
-      return users if sort_by.blank?
+    def sort_records(records, model, sort_by, sort_order)
+      return records if sort_by.blank?
 
-      attribute = ::Authn::User.scim_attribute_for(sort_by)
-      return users if attribute.nil?
+      attribute = model.scim_attribute_for(sort_by)
+      return records if attribute.nil?
 
-      sorted = users.sort_by { |user| user[attribute].to_s }
+      sorted = records.sort_by { |record| record[attribute].to_s }
       sort_order == "descending" ? sorted.reverse : sorted
     end
 
-    def paginate(users, request)
+    def paginate(records, request, &builder)
       start_index = [request.params["startIndex"].to_i, 1].max
       count_param = request.params["count"]
-      count = count_param.nil? ? users.size : [count_param.to_i, 0].max
-      page = users.drop(start_index - 1).first(count)
-      resources = page.map { |user| select_attributes(resource_for(user).to_h, request) }
+      count = count_param.nil? ? records.size : [count_param.to_i, 0].max
+      page = records.drop(start_index - 1).first(count)
+      resources = page.map { |record| select_attributes(builder.call(record).to_h, request) }
 
-      list_response(resources, total: users.size, start_index: start_index)
+      list_response(resources, total: records.size, start_index: start_index)
     end
 
     def get_schema(id)
@@ -874,7 +1021,15 @@ module Authn
       user, error = find_user(id)
       return error if error
 
-      hash = select_attributes(resource_for(user).to_h, request)
+      hash = select_attributes(user_resource_for(user).to_h, request)
+      [200, scim_headers, [JSON.generate(hash)]]
+    end
+
+    def get_group(request, id)
+      group, error = find_group(id)
+      return error if error
+
+      hash = select_attributes(group_resource_for(group).to_h, request)
       [200, scim_headers, [JSON.generate(hash)]]
     end
 
@@ -898,7 +1053,18 @@ module Authn
       return scim_error(409, "User #{params[:username]} already exists", scim_type: "uniqueness") if username_taken?(params[:username])
 
       user = ::Authn::User.create!(**params)
-      resource = resource_for(user)
+      resource = user_resource_for(user)
+      [201, scim_headers.merge("Location" => resource.meta.location), [JSON.generate(resource.to_h)]]
+    rescue JSON::ParserError
+      scim_error(400, "Invalid JSON")
+    end
+
+    def post_groups(request)
+      params = group_params_from(request)
+      return scim_error(400, "displayName is required") if params[:display_name].blank?
+
+      group = ::Authn::Group.create!(**params)
+      resource = group_resource_for(group)
       [201, scim_headers.merge("Location" => resource.meta.location), [JSON.generate(resource.to_h)]]
     rescue JSON::ParserError
       scim_error(400, "Invalid JSON")
@@ -913,7 +1079,20 @@ module Authn
       return scim_error(409, "User #{params[:username]} already exists", scim_type: "uniqueness") if username_taken?(params[:username], except_id: user.id)
 
       user.update!(**params)
-      [200, scim_headers, [JSON.generate(resource_for(user).to_h)]]
+      [200, scim_headers, [JSON.generate(user_resource_for(user).to_h)]]
+    rescue JSON::ParserError
+      scim_error(400, "Invalid JSON")
+    end
+
+    def put_group(request, id)
+      group, error = find_group(id)
+      return error if error
+
+      params = group_params_from(request)
+      return scim_error(400, "displayName is required") if params[:display_name].blank?
+
+      group.update!(**params)
+      [200, scim_headers, [JSON.generate(group_resource_for(group).to_h)]]
     rescue JSON::ParserError
       scim_error(400, "Invalid JSON")
     end
@@ -933,7 +1112,27 @@ module Authn
       end
 
       user.apply_patch_state!(new_state)
-      hash = select_attributes(resource_for(user).to_h, request)
+      hash = select_attributes(user_resource_for(user).to_h, request)
+      [200, scim_headers, [JSON.generate(hash)]]
+    rescue JSON::ParserError
+      scim_error(400, "Invalid JSON")
+    rescue ::Scim::PatchError => error
+      scim_error(error.status, error.message, scim_type: error.scim_type)
+    rescue ::Scim::Kit::Error => error
+      scim_error(400, error.message)
+    end
+
+    def patch_group(request, id)
+      group, error = find_group(id)
+      return error if error
+
+      body = JSON.parse(request.body.read, symbolize_names: true)
+      operations = body[:Operations]
+      return scim_error(400, "Operations is required") if operations.blank?
+
+      new_state = ::Scim::PatchOp.apply(group.scim_profile, operations, rules: ::Scim::PatchOp::GROUP_RULES)
+      group.apply_patch_state!(new_state)
+      hash = select_attributes(group_resource_for(group).to_h, request)
       [200, scim_headers, [JSON.generate(hash)]]
     rescue JSON::ParserError
       scim_error(400, "Invalid JSON")
@@ -950,11 +1149,25 @@ module Authn
       [204, {}, []]
     end
 
+    def delete_group(id)
+      group = ::Authn::Group.delete!(id)
+      return scim_error(404, "Group #{id} not found") if group.nil?
+
+      [204, {}, []]
+    end
+
     def find_user(id)
       user = ::Authn::User.find(id)
       return [nil, scim_error(404, "User #{id} not found")] if user.nil?
 
       [user, nil]
+    end
+
+    def find_group(id)
+      group = ::Authn::Group.find(id)
+      return [nil, scim_error(404, "Group #{id} not found")] if group.nil?
+
+      [group, nil]
     end
 
     def params_from(request)
@@ -967,6 +1180,16 @@ module Authn
         given_name: attributes.dig(:name, :givenName),
         family_name: attributes.dig(:name, :familyName),
         emails: attributes[:emails],
+        roles: attributes[:roles],
+        external_id: attributes[:externalId],
+      }
+    end
+
+    def group_params_from(request)
+      attributes = JSON.parse(request.body.read, symbolize_names: true)
+      {
+        display_name: attributes[:displayName],
+        members: attributes[:members],
         external_id: attributes[:externalId],
       }
     end
@@ -976,7 +1199,7 @@ module Authn
       existing && existing.id != except_id
     end
 
-    def resource_for(user)
+    def user_resource_for(user)
       ::Scim::Kit::V2::Resource.new(
         schemas: [configuration.schemas[::Scim::Kit::V2::Schemas::USER]],
         location: "#{@base_url}/Users/#{user.id}",
@@ -984,6 +1207,17 @@ module Authn
       ) do |resource|
         resource.meta.created = user.created_at
         resource.meta.last_modified = user.updated_at
+      end
+    end
+
+    def group_resource_for(group)
+      ::Scim::Kit::V2::Resource.new(
+        schemas: [configuration.schemas[::Scim::Kit::V2::Schemas::GROUP]],
+        location: "#{@base_url}/Groups/#{group.id}",
+        attributes: group.scim_profile.merge(id: group.id)
+      ) do |resource|
+        resource.meta.created = group.created_at
+        resource.meta.last_modified = group.updated_at
       end
     end
 
