@@ -212,13 +212,15 @@ module Scim
   class PatchOp
     USER_RULES = {
       mutable: %i[user_name active name emails roles external_id],
-      unsupported: %i[password id meta schemas],
+      ignored: %i[id meta schemas],
+      unsupported: %i[password],
       required: %i[user_name],
       multi_valued: %i[emails roles],
     }.freeze
     GROUP_RULES = {
       mutable: %i[display_name members external_id],
-      unsupported: %i[id meta schemas],
+      ignored: %i[id meta schemas],
+      unsupported: %i[],
       required: %i[display_name],
       multi_valued: %i[members],
     }.freeze
@@ -257,6 +259,8 @@ module Scim
       end
 
       target = ::Scim::PatchPath.new(path)
+      return if ignored?(target.attribute)
+
       assert_mutable!(target.attribute)
 
       if @rules[:multi_valued].include?(target.attribute)
@@ -271,6 +275,8 @@ module Scim
       raise ::Scim::PatchError.new("path is required for remove", scim_type: "noTarget") if path.blank?
 
       target = ::Scim::PatchPath.new(path)
+      return if ignored?(target.attribute)
+
       assert_mutable!(target.attribute)
       if @rules[:required].include?(target.attribute)
         raise ::Scim::PatchError.new("#{target.attribute} is required", scim_type: "mutability")
@@ -339,6 +345,10 @@ module Scim
 
     def underscore_keys(hash)
       hash.transform_keys { |key| Scim.attribute_key(key) }
+    end
+
+    def ignored?(attribute)
+      @rules[:ignored].include?(attribute)
     end
 
     def assert_mutable!(attribute)
