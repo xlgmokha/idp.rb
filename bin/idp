@@ -74,12 +74,14 @@ module HTTPHelpers
 end
 
 module Scim
+  # String comparisons are case-insensitive: every filterable attribute here
+  # (userName, displayName, ...) is caseExact=false, the SCIM default (RFC 7643).
   COMPARATORS = {
-    eq: ->(value, target) { value == target },
-    ne: ->(value, target) { value != target },
-    co: ->(value, target) { value.include?(target) },
-    sw: ->(value, target) { value.start_with?(target) },
-    ew: ->(value, target) { value.end_with?(target) },
+    eq: ->(value, target) { value.casecmp?(target) },
+    ne: ->(value, target) { !value.casecmp?(target) },
+    co: ->(value, target) { value.downcase.include?(target.downcase) },
+    sw: ->(value, target) { value.downcase.start_with?(target.downcase) },
+    ew: ->(value, target) { value.downcase.end_with?(target.downcase) },
     gt: ->(value, target) { value > target },
     ge: ->(value, target) { value >= target },
     lt: ->(value, target) { value < target },
@@ -104,9 +106,17 @@ module Scim
     def for(filter)
       return @clazz.all if filter.blank?
 
-      ::Scim::Kit::V2::Filter
-        .parse(filter)
-        .accept(Scim::Visitor.new(@clazz))
+      parse(filter).accept(Scim::Visitor.new(@clazz))
+    end
+
+    private
+
+    def parse(filter)
+      ::Scim::Kit::V2::Filter.parse(filter)
+    rescue ::Scim::Kit::Error
+      raise
+    rescue StandardError
+      raise ::Scim::Kit::Error, "invalid filter: #{filter}"
     end
   end
 
@@ -202,6 +212,10 @@ module Scim
 
     def filter_node
       @filter_node ||= ::Scim::Kit::V2::Filter.parse(filter)
+    rescue ::Scim::Kit::Error
+      raise
+    rescue StandardError
+      raise ::Scim::Kit::Error, "invalid filter: #{filter}"
     end
   end
 
@@ -308,9 +322,9 @@ module Scim
           end
         end
       elsif replace
-        @state[target.attribute] = Array(value).map { |item| underscore_keys(item) }
+        @state[target.attribute] = Array.wrap(value).map { |item| underscore_keys(item) }
       else
-        additions = Array(value).map { |item| underscore_keys(item) }
+        additions = Array.wrap(value).map { |item| underscore_keys(item) }
         array.concat(additions.reject { |item| array.include?(item) })
       end
 
@@ -344,6 +358,10 @@ module Scim
     end
 
     def underscore_keys(hash)
+      unless hash.is_a?(Hash)
+        raise ::Scim::PatchError.new("expected an object value", scim_type: "invalidValue")
+      end
+
       hash.transform_keys { |key| Scim.attribute_key(key) }
     end
 
@@ -419,9 +437,8 @@ module Authn
       end
 
       def create!(username:, email: nil, password: nil, active: true, given_name: nil, family_name: nil, emails: nil, roles: nil, external_id: nil)
-        id = (all.map { |user| user.id.to_i }.max || 0) + 1
         user = new(
-          id: id.to_s,
+          id: ::SecureRandom.uuid,
           username: username,
           email: email.to_s,
           password_digest: ::BCrypt::Password.create(password.presence || ::SecureRandom.hex(16)).to_s
@@ -566,6 +583,7 @@ module Authn
         {
           "id" => :id,
           "display_name" => :display_name,
+          "external_id" => :external_id,
         }
       end
 
@@ -574,8 +592,7 @@ module Authn
       end
 
       def create!(display_name:, members: nil, external_id: nil)
-        id = (all.map { |group| group.id.to_i }.max || 0) + 1
-        group = new(id: id.to_s, display_name: display_name, members: members, external_id: external_id)
+        group = new(id: ::SecureRandom.uuid, display_name: display_name, members: members, external_id: external_id)
         all << group
         group
       end
@@ -1111,12 +1128,13 @@ module Authn
       user, error = find_user(id)
       return error if error
 
-      body = JSON.parse(request.body.read, symbolize_names: true)
+      body = parse_object(request)
       operations = body[:Operations]
       return scim_error(400, "Operations is required") if operations.blank?
 
       new_state = ::Scim::PatchOp.apply(user.scim_profile, operations)
       new_username = new_state[:user_name]
+      return scim_error(400, "userName is required") if new_username.blank?
       if new_username != user[:username] && username_taken?(new_username, except_id: user.id)
         return scim_error(409, "User #{new_username} already exists", scim_type: "uniqueness")
       end
@@ -1136,11 +1154,13 @@ module Authn
       group, error = find_group(id)
       return error if error
 
-      body = JSON.parse(request.body.read, symbolize_names: true)
+      body = parse_object(request)
       operations = body[:Operations]
       return scim_error(400, "Operations is required") if operations.blank?
 
       new_state = ::Scim::PatchOp.apply(group.scim_profile, operations, rules: ::Scim::PatchOp::GROUP_RULES)
+      return scim_error(400, "displayName is required") if new_state[:display_name].blank?
+
       group.apply_patch_state!(new_state)
       hash = select_attributes(group_resource_for(group).to_h, request)
       [200, scim_headers, [JSON.generate(hash)]]
@@ -1180,8 +1200,15 @@ module Authn
       [group, nil]
     end
 
+    def parse_object(request)
+      parsed = JSON.parse(request.body.read, symbolize_names: true)
+      raise JSON::ParserError, "expected a JSON object" unless parsed.is_a?(Hash)
+
+      parsed
+    end
+
     def params_from(request)
-      attributes = JSON.parse(request.body.read, symbolize_names: true)
+      attributes = parse_object(request)
       {
         username: attributes[:userName],
         email: attributes.dig(:emails, 0, :value),
@@ -1196,7 +1223,7 @@ module Authn
     end
 
     def group_params_from(request)
-      attributes = JSON.parse(request.body.read, symbolize_names: true)
+      attributes = parse_object(request)
       {
         display_name: attributes[:displayName],
         members: attributes[:members],
