@@ -1,2 +1,2 @@
-"id","username","email","password_digest"
-"BC119330-9586-462F-B399-BDB6258A27DC","root","root@example.org","$2a$12$1MXTVV4pt3gtMo3dlnlPV.eZmLkV/8UK10z60M.q5rEPA7AK.cHiW"
+id,username,password_digest,active,given_name,family_name,emails,roles,external_id,created_at,updated_at
+BC119330-9586-462F-B399-BDB6258A27DC,root,$2a$12$1MXTVV4pt3gtMo3dlnlPV.eZmLkV/8UK10z60M.q5rEPA7AK.cHiW,true,,,"[{""value"":""root@example.org"",""primary"":true}]",[],,2026-07-24T00:00:00Z,2026-07-24T00:00:00Z

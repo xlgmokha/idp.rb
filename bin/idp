@@ -10,11 +10,15 @@ gemfile do
   gem "csv", "~> 3.0"
   gem "erb", "~> 4.0"
   gem "globalid", "~> 1.0"
+  gem "logger", "~> 1.0"
+  gem "net-hippie", "~> 1.0"
   gem "rack", "~> 3.0"
   gem "rack-session", "~> 2.0"
   gem "rackup", "~> 2.0"
   gem "saml-kit", "1.4.0"
   gem "scim-kit", "0.8.0"
+  gem "stringio", "~> 3.0"
+  gem "time", "~> 0.1"
   gem "warden", "~> 1.0"
   gem "webrick", "~> 1.0"
 end
@@ -74,8 +78,6 @@ module HTTPHelpers
 end
 
 module Scim
-  # String comparisons are case-insensitive: every filterable attribute here
-  # (userName, displayName, ...) is caseExact=false, the SCIM default (RFC 7643).
   COMPARATORS = {
     eq: ->(value, target) { value.casecmp?(target) },
     ne: ->(value, target) { !value.casecmp?(target) },
@@ -155,10 +157,6 @@ module Scim
     raise ::Scim::Kit::Error, "invalid filter: #{filter}"
   end
 
-  # Evaluates a SCIM filter expression against a plain attribute Hash. Used to
-  # resolve PATCH valuePath filters, e.g. `emails[type eq "work"]`. A second
-  # Filter::Visitor subclass alongside Scim::Visitor -- same dispatch/comparator
-  # mechanism, but reading from a plain Hash instead of scanning @clazz.all.
   class FilterMatcher < Scim::Kit::V2::Filter::Visitor
     def self.matches?(hash, filter_or_node)
       node = filter_or_node.is_a?(String) ? Scim.parse_filter(filter_or_node) : filter_or_node
@@ -188,8 +186,6 @@ module Scim
     end
   end
 
-  # Parses a SCIM PATCH "path" (RFC 7644 3.5.2), e.g. "name.givenName",
-  # "emails", "emails[type eq \"work\"]", "emails[type eq \"work\"].value".
   class PatchPath
     PATTERN = %r{\A(?<attribute>[A-Za-z][\w]*)(?:\[(?<filter>.+)\])?(?:\.(?<sub_attribute>[A-Za-z][\w]*))?\z}
 
@@ -213,10 +209,6 @@ module Scim
     end
   end
 
-  # Applies a sequence of RFC 7644 3.5.2 PATCH operations to a plain Hash
-  # representation of a User's mutable SCIM attributes, returning the
-  # resulting Hash. Operates on a deep copy so a failed operation never
-  # mutates the caller's state (PATCH requests are atomic per the RFC).
   class PatchOp
     USER_RULES = {
       mutable: %i[user_name active name emails roles external_id],
@@ -373,17 +365,252 @@ module Scim
       raise ::Scim::PatchError.new("unknown attribute: #{attribute}", scim_type: "invalidPath")
     end
   end
+
+  class Client
+    Response = Struct.new(:status, :body) do
+      def success?
+        (200..299).cover?(status)
+      end
+
+      def resource
+        parsed = JSON.parse(body.to_s, symbolize_names: true)
+        parsed.is_a?(Hash) ? parsed : {}
+      rescue JSON::ParserError
+        {}
+      end
+    end
+
+    def initialize(base_url, token)
+      @base_url = base_url.to_s.chomp("/")
+      headers = {
+        "Accept" => "application/scim+json",
+        "Content-Type" => "application/scim+json",
+      }
+      headers["Authorization"] = "Bearer #{token}" if token.present?
+      @http = Net::Hippie::Client.new(headers: headers)
+    end
+
+    def get(path, params = {})
+      uri = uri_for(path)
+      uri.query = URI.encode_www_form(params) if params.any?
+      execute { |http| http.get(uri) }
+    end
+
+    def post(path, payload)
+      execute { |http| http.post(uri_for(path), body: payload) }
+    end
+
+    def put(path, payload)
+      execute { |http| http.put(uri_for(path), body: payload) }
+    end
+
+    def patch(path, payload)
+      execute { |http| http.patch(uri_for(path), body: payload) }
+    end
+
+    def delete(path)
+      execute { |http| http.delete(uri_for(path)) }
+    end
+
+    private
+
+    def uri_for(path)
+      URI.parse("#{@base_url}#{path}")
+    end
+
+    def execute
+      response = @http.with_retry { |http| yield(http) }
+      Response.new(response.code.to_i, response.body)
+    end
+  end
+
+  class Push
+    USER_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:User"
+    GROUP_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:Group"
+
+    class << self
+      def configured?
+        ENV["SCIM_PUSH_URL"].present?
+      end
+
+      def instance
+        @instance ||= new(Client.new(ENV.fetch("SCIM_PUSH_URL"), ENV["SCIM_PUSH_TOKEN"]))
+      end
+
+      def after_save(record)
+        auto { |push| record.is_a?(::Authn::Group) ? push.push_group(record) : push.push_user(record) }
+      end
+
+      def after_delete(record)
+        auto { |push| record.is_a?(::Authn::Group) ? push.delete_group(record) : push.delete_user(record) }
+      end
+
+      private
+
+      def auto
+        return unless configured?
+
+        yield instance
+      end
+    end
+
+    def initialize(client)
+      @client = client
+      @remote_users = {}
+      @remote_groups = {}
+    end
+
+    def sync_all
+      ::Authn::User.all.map { |user| safely("User", user[:username]) { push_user(user) } } +
+        ::Authn::Group.all.map { |group| safely("Group", group.display_name) { push_group(group) } }
+    end
+
+    def push_user(user)
+      push("User", "/Users", @remote_users, user.id, "userName", user[:username], user_payload(user))
+    end
+
+    def push_group(group)
+      push("Group", "/Groups", @remote_groups, group.id, "displayName", group.display_name, group_payload(group))
+    end
+
+    def delete_user(user)
+      remove("User", "/Users", @remote_users, user.id, "userName", user[:username])
+    end
+
+    def delete_group(group)
+      remove("Group", "/Groups", @remote_groups, group.id, "displayName", group.display_name)
+    end
+
+    private
+
+    def push(type, path, cache, key, attribute, value, payload)
+      remote_id = cache[key] || find_remote(path, attribute, value)
+      action = remote_id ? "update" : "create"
+      response = remote_id ? @client.put("#{path}/#{remote_id}", payload) : @client.post(path, payload)
+      remote_id ||= response.resource[:id]
+      cache[key] = remote_id if remote_id
+      result(type, value, action, response, remote_id)
+    end
+
+    def remove(type, path, cache, key, attribute, value)
+      remote_id = cache.delete(key) || find_remote(path, attribute, value)
+      return missing(type, value) if remote_id.nil?
+
+      result(type, value, "delete", @client.delete("#{path}/#{remote_id}"), remote_id)
+    end
+
+    def find_remote(path, attribute, value)
+      escaped = value.to_s.gsub('"') { '\\"' }
+      response = @client.get(path, "filter" => %(#{attribute} eq "#{escaped}"))
+      resources = response.resource[:Resources]
+      resources.is_a?(Array) ? resources.dig(0, :id) : nil
+    end
+
+    def remote_user_id(local_id)
+      @remote_users[local_id] ||= begin
+        user = ::Authn::User.find(local_id)
+        user && find_remote("/Users", "userName", user[:username])
+      end
+    end
+
+    def user_payload(user)
+      payload = {
+        schemas: [USER_SCHEMA],
+        userName: user[:username],
+        active: user.active,
+        emails: user.emails,
+        roles: user.roles,
+      }
+      name = { givenName: user.given_name, familyName: user.family_name }.compact
+      payload[:name] = name if name.present?
+      payload[:externalId] = user.external_id if user.external_id
+      payload
+    end
+
+    def group_payload(group)
+      members = group.members.filter_map do |member|
+        remote_id = remote_user_id(member[:value].to_s)
+        next if remote_id.nil?
+
+        { value: remote_id }
+      end
+      payload = {
+        schemas: [GROUP_SCHEMA],
+        displayName: group.display_name,
+        members: members,
+      }
+      payload[:externalId] = group.external_id if group.external_id
+      payload
+    end
+
+    def result(type, name, action, response, remote_id)
+      { type: type, name: name, action: action, status: response.status, remote_id: remote_id, ok: response.success? }
+    end
+
+    def missing(type, name)
+      { type: type, name: name, action: "delete", status: nil, remote_id: nil, ok: true }
+    end
+
+    def safely(type, name)
+      yield
+    rescue StandardError => error
+      { type: type, name: name, ok: false, error: "#{error.class}: #{error.message}" }
+    end
+  end
 end
 
 module Authn
+  module Store
+    MUTEX = Mutex.new
+
+    def self.path_for(name)
+      File.join(__dir__, "../share/idp/#{name}.csv")
+    end
+
+    def self.write(path, headers, rows)
+      MUTEX.synchronize do
+        temp = File.join(File.dirname(path), ".#{File.basename(path)}.tmp")
+        ::CSV.open(temp, "w", write_headers: true, headers: headers) do |csv|
+          rows.each { |row| csv << row }
+        end
+        File.rename(temp, path)
+      end
+    end
+
+    def self.read(path)
+      return [] unless File.exist?(path)
+
+      ::CSV.read(path, headers: true).map { |row| row.to_h.transform_keys(&:to_sym) }
+    end
+
+    def self.json_array(value)
+      return value if value.is_a?(Array)
+      return [] if value.blank?
+
+      JSON.parse(value, symbolize_names: true)
+    end
+
+    def self.boolean(value)
+      value.nil? ? true : value.to_s == "true"
+    end
+
+    def self.time_at(value)
+      value.blank? ? Time.now : Time.parse(value.to_s)
+    end
+  end
+
   class User
     include ::BCrypt
 
+    HEADERS = %w[id username password_digest active given_name family_name emails roles external_id created_at updated_at].freeze
+
     class << self
       def all
-        @all ||= ::CSV.read(File.join(__dir__, "../share/idp/users.csv"), headers: true).map do |row|
-          new(row.to_h.transform_keys(&:to_sym))
-        end
+        @all ||= Store.read(Store.path_for("users")).map { |attributes| new(attributes) }
+      end
+
+      def save!
+        Store.write(Store.path_for("users"), HEADERS, all.map(&:to_row))
       end
 
       def find(id)
@@ -400,7 +627,7 @@ module Authn
 
       def find_by_email(email)
         find_by do |user|
-          user[:email] == email
+          user.emails.any? { |x| x.is_a?(Hash) && x[:value] == email }
         end
       end
 
@@ -430,21 +657,27 @@ module Authn
         scim_mapper[name.to_s.underscore]
       end
 
-      def create!(username:, email: nil, password: nil, active: true, given_name: nil, family_name: nil, emails: nil, roles: nil, external_id: nil)
+      def create!(username:, password: nil, active: true, given_name: nil, family_name: nil, emails: nil, roles: nil, external_id: nil)
         user = new(
           id: ::SecureRandom.uuid,
           username: username,
-          email: email.to_s,
           password_digest: ::BCrypt::Password.create(password.presence || ::SecureRandom.hex(16)).to_s
         )
         user.assign_profile!(active: active, given_name: given_name, family_name: family_name, emails: emails, roles: roles, external_id: external_id)
         all << user
+        save!
+        ::Scim::Push.after_save(user)
         user
       end
 
       def delete!(id)
         index = all.find_index { |user| user.id == id }
-        index && all.delete_at(index)
+        record = index && all.delete_at(index)
+        if record
+          save!
+          ::Scim::Push.after_delete(record)
+        end
+        record
       end
     end
 
@@ -452,20 +685,37 @@ module Authn
     attr_accessor :active, :given_name, :family_name, :emails, :roles, :external_id
 
     def initialize(attributes)
-      @attributes = attributes
+      attributes = attributes.transform_keys(&:to_sym)
+      @attributes = attributes.slice(:id, :username, :password_digest)
       @id = self[:id]
-      @created_at = Time.now
-      @updated_at = @created_at
-      @active = true
-      @given_name = nil
-      @family_name = nil
-      @emails = []
-      @roles = []
-      @external_id = nil
+      @active = Store.boolean(attributes[:active])
+      @given_name = attributes[:given_name].presence
+      @family_name = attributes[:family_name].presence
+      @emails = Store.json_array(attributes[:emails])
+      @roles = Store.json_array(attributes[:roles])
+      @external_id = attributes[:external_id].presence
+      @created_at = Store.time_at(attributes[:created_at])
+      @updated_at = Store.time_at(attributes[:updated_at])
     end
 
     def [](attribute)
       @attributes.fetch(attribute.to_sym)
+    end
+
+    def to_row
+      [
+        id,
+        self[:username],
+        self[:password_digest],
+        active,
+        given_name,
+        family_name,
+        JSON.generate(emails),
+        JSON.generate(roles),
+        external_id,
+        created_at.iso8601,
+        updated_at.iso8601,
+      ]
     end
 
     def assign_profile!(active:, given_name:, family_name:, emails:, roles:, external_id:)
@@ -478,11 +728,12 @@ module Authn
       self
     end
 
-    def update!(username:, email: nil, active: true, given_name: nil, family_name: nil, emails: nil, roles: nil, external_id: nil)
+    def update!(username:, active: true, given_name: nil, family_name: nil, emails: nil, roles: nil, external_id: nil)
       @attributes[:username] = username
-      @attributes[:email] = email.to_s
       assign_profile!(active: active, given_name: given_name, family_name: family_name, emails: emails, roles: roles, external_id: external_id)
       @updated_at = Time.now
+      self.class.save!
+      ::Scim::Push.after_save(self)
       self
     end
 
@@ -509,12 +760,20 @@ module Authn
       self.roles = state[:roles] if state.key?(:roles)
       self.external_id = state[:external_id] if state.key?(:external_id)
       @updated_at = Time.now
+      self.class.save!
+      ::Scim::Push.after_save(self)
       self
+    end
+
+    def primary_email
+      entries = emails.select { |x| x.is_a?(Hash) }
+      entry = entries.find { |x| x[:primary] } || entries.first
+      entry && entry[:value]
     end
 
     def name_id_for(name_id_format)
       if name_id_format == Saml::Kit::Namespaces::EMAIL_ADDRESS
-        self[:email]
+        primary_email
       else
         self[:id]
       end
@@ -524,7 +783,7 @@ module Authn
       ::Authz::JWT.new(
         sub: to_global_id.to_s,
         auth_time: Time.now.to_i,
-        email: self[:email],
+        email: primary_email,
         username: self[:username],
       )
     end
@@ -535,7 +794,7 @@ module Authn
 
     def assertion_attributes_for(request)
       {
-        email: self[:email],
+        email: primary_email,
       }
     end
 
@@ -556,9 +815,15 @@ module Authn
   end
 
   class Group
+    HEADERS = %w[id display_name members external_id created_at updated_at].freeze
+
     class << self
       def all
-        @all ||= []
+        @all ||= Store.read(Store.path_for("groups")).map { |attributes| new(**attributes) }
+      end
+
+      def save!
+        Store.write(Store.path_for("groups"), HEADERS, all.map(&:to_row))
       end
 
       def find(id)
@@ -584,25 +849,43 @@ module Authn
       def create!(display_name:, members: nil, external_id: nil)
         group = new(id: ::SecureRandom.uuid, display_name: display_name, members: members, external_id: external_id)
         all << group
+        save!
+        ::Scim::Push.after_save(group)
         group
       end
 
       def delete!(id)
         index = all.find_index { |group| group.id == id }
-        index && all.delete_at(index)
+        record = index && all.delete_at(index)
+        if record
+          save!
+          ::Scim::Push.after_delete(record)
+        end
+        record
       end
     end
 
     attr_reader :id, :created_at, :updated_at
     attr_accessor :display_name, :members, :external_id
 
-    def initialize(id:, display_name:, members: nil, external_id: nil)
+    def initialize(id:, display_name:, members: nil, external_id: nil, created_at: nil, updated_at: nil)
       @id = id
       @display_name = display_name
-      @members = members || []
-      @external_id = external_id
-      @created_at = Time.now
-      @updated_at = @created_at
+      @members = Store.json_array(members)
+      @external_id = external_id.presence
+      @created_at = Store.time_at(created_at)
+      @updated_at = Store.time_at(updated_at)
+    end
+
+    def to_row
+      [
+        id,
+        display_name,
+        JSON.generate(members),
+        external_id,
+        created_at.iso8601,
+        updated_at.iso8601,
+      ]
     end
 
     def [](attribute)
@@ -618,6 +901,8 @@ module Authn
       self.members = members || []
       self.external_id = external_id
       @updated_at = Time.now
+      self.class.save!
+      ::Scim::Push.after_save(self)
       self
     end
 
@@ -634,6 +919,8 @@ module Authn
       self.members = state[:members] if state.key?(:members)
       self.external_id = state[:external_id] if state.key?(:external_id)
       @updated_at = Time.now
+      self.class.save!
+      ::Scim::Push.after_save(self)
       self
     end
   end
@@ -729,7 +1016,6 @@ module Authn
       Saml::Kit.configure do |x|
         x.entity_id = "#{scheme}://#{host}/saml/metadata.xml"
         x.registry = OnDemandRegistry.new
-        x.logger = Logger.new("/dev/stderr")
       end
 
       @saml_metadata = Saml::Kit::Metadata.build do |builder|
@@ -740,6 +1026,10 @@ module Authn
           x.add_single_sign_on_service("#{scheme}://#{host}/saml/new", binding: :http_post)
           x.name_id_formats = [Saml::Kit::Namespaces::PERSISTENT, Saml::Kit::Namespaces::EMAIL_ADDRESS]
           x.attributes << :email
+        end
+        builder.build_service_provider do |x|
+          x.add_assertion_consumer_service("#{scheme}://#{host}/saml/acs", binding: :http_post)
+          x.name_id_formats = [Saml::Kit::Namespaces::PERSISTENT, Saml::Kit::Namespaces::EMAIL_ADDRESS]
         end
       end
     end
@@ -1174,7 +1464,6 @@ module Authn
       attributes = parse_object(request)
       {
         username: attributes[:userName],
-        email: attributes.dig(:emails, 0, :value),
         password: attributes[:password],
         active: attributes[:active],
         given_name: attributes.dig(:name, :givenName),
@@ -1662,6 +1951,14 @@ class IdentityProvider
 end
 
 if __FILE__ == $0
+  if ARGV[0] == "push"
+    abort("SCIM_PUSH_URL is required") unless Scim::Push.configured?
+
+    results = Scim::Push.instance.sync_all
+    failed = results.count { |entry| !entry[:ok] }
+    exit(failed.zero? ? 0 : 1)
+  end
+
   app = Rack::Builder.new do
     use Rack::CommonLogger
     use Rack::Reloader
