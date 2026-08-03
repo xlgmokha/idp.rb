@@ -1075,6 +1075,10 @@ module Authn
 
     attr_reader :saml_metadata
 
+    def sign_assertions?
+      ENV.fetch("SAML_SIGN", "true") != "false"
+    end
+
     def saml_post_back(request, user, saml_params)
       saml_request = binding_for(request).deserialize(saml_params)
 
@@ -1083,7 +1087,10 @@ module Authn
         user,
         binding: :http_post,
         relay_state: saml_params[:RelayState]
-      ) { |builder| @builder = builder }
+      ) do |builder|
+        builder.embed_signature = false unless sign_assertions?
+        @builder = builder
+      end
       template = <<~ERB
       <!doctype html>
       <html lang="en" data-theme="light">
