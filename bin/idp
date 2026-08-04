@@ -1154,6 +1154,7 @@ module Authn
     GROUP_ID_PATH = %r{\A/scim/v2/Groups/(?<id>[^/]+)\z}
     SCHEMA_ID_PATH = %r{\A/scim/v2/Schemas/(?<id>.+)\z}
     CORE_ATTRIBUTES = %w[schemas id meta].freeze
+    MAX_RESULTS = 200
 
     attr_reader :base_url
 
@@ -1164,8 +1165,13 @@ module Authn
           x.documentation_uri = "#{base_url}/doc"
           x.add_authentication(:oauthbearertoken, primary: true)
           x.filter.supported = true
+          x.filter.max_results = MAX_RESULTS
+          x.bulk.supported = false
+          x.bulk.max_operations = 0
+          x.bulk.max_payload_size = 0
           x.sort.supported = true
           x.patch.supported = true
+          x.meta.version = etag_for(x.meta.last_modified)
         end
         config.resource_type(id: 'User', location: "#{base_url}/ResourceTypes/User") do |x|
           x.name = 'User'
@@ -1238,13 +1244,13 @@ module Authn
         when "/scim/v2/ServiceProviderConfig"
           return [200, scim_headers, [configuration.service_provider_configuration.to_json]]
         when "/scim/v2/ResourceTypes"
-          return [200, scim_headers, [JSON.pretty_generate(configuration.resource_types.values.map(&:to_h))]]
+          return discovery_response(configuration.resource_types.values, ::Scim::Kit::V2::Schemas::RESOURCE_TYPE)
         when "/scim/v2/ResourceTypes/User"
           return [200, scim_headers, [configuration.resource_types["User"].to_json]]
         when "/scim/v2/ResourceTypes/Group"
           return [200, scim_headers, [configuration.resource_types["Group"].to_json]]
         when "/scim/v2/Schemas"
-          return [200, scim_headers, [JSON.pretty_generate(configuration.schemas.values.map(&:to_h))]]
+          return discovery_response(configuration.schemas.values, ::Scim::Kit::V2::Schemas::SCHEMA)
         when SCHEMA_ID_PATH
           return get_schema($~[:id])
         when "/scim/v2/Users"
@@ -1327,7 +1333,7 @@ module Authn
       start_index = [request.params["startIndex"].to_i, 1].max
       count_param = request.params["count"]
       count = count_param.nil? ? records.size : [count_param.to_i, 0].max
-      page = records.drop(start_index - 1).first(count)
+      page = records.drop(start_index - 1).first([count, MAX_RESULTS].min)
       resources = page.map { |record| select_attributes(builder.call(record).to_h, request) }
 
       list_response(resources, total: records.size, start_index: start_index)
@@ -1337,7 +1343,8 @@ module Authn
       schema = configuration.schemas[id]
       return scim_error(404, "Schema #{id} not found") if schema.nil?
 
-      [200, scim_headers, [schema.to_json]]
+      hash = with_schemas(schema.to_h, ::Scim::Kit::V2::Schemas::SCHEMA)
+      [200, scim_headers, [JSON.pretty_generate(hash)]]
     end
 
     def get_user(request, id)
@@ -1513,7 +1520,22 @@ module Authn
       ) do |resource|
         resource.meta.created = record.created_at
         resource.meta.last_modified = record.updated_at
+        resource.meta.version = etag_for(record.updated_at)
       end
+    end
+
+    def etag_for(time)
+      %(W/"#{time.to_i}")
+    end
+
+    def discovery_response(resources, schema)
+      hashes = resources.map { |resource| with_schemas(resource.to_h, schema) }
+      list_response(hashes, total: hashes.size, start_index: 1)
+    end
+
+    def with_schemas(hash, schema)
+      hash["schemas"] ||= [schema]
+      hash
     end
 
     def list_response(resources, total:, start_index:)
