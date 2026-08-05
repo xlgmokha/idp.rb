@@ -1244,13 +1244,13 @@ module Authn
         when "/scim/v2/ServiceProviderConfig"
           return [200, scim_headers, [configuration.service_provider_configuration.to_json]]
         when "/scim/v2/ResourceTypes"
-          return discovery_response(configuration.resource_types.values, ::Scim::Kit::V2::Schemas::RESOURCE_TYPE)
+          return list_response(configuration.resource_types.values.map(&:to_h))
         when "/scim/v2/ResourceTypes/User"
           return [200, scim_headers, [configuration.resource_types["User"].to_json]]
         when "/scim/v2/ResourceTypes/Group"
           return [200, scim_headers, [configuration.resource_types["Group"].to_json]]
         when "/scim/v2/Schemas"
-          return discovery_response(configuration.schemas.values, ::Scim::Kit::V2::Schemas::SCHEMA)
+          return list_response(configuration.schemas.values.map(&:to_h))
         when SCHEMA_ID_PATH
           return get_schema($~[:id])
         when "/scim/v2/Users"
@@ -1331,9 +1331,8 @@ module Authn
 
     def paginate(records, request, &builder)
       start_index = [request.params["startIndex"].to_i, 1].max
-      count_param = request.params["count"]
-      count = count_param.nil? ? records.size : [count_param.to_i, 0].max
-      page = records.drop(start_index - 1).first([count, MAX_RESULTS].min)
+      count = (request.params["count"] || MAX_RESULTS).to_i.clamp(0, MAX_RESULTS)
+      page = records.drop(start_index - 1).first(count)
       resources = page.map { |record| select_attributes(builder.call(record).to_h, request) }
 
       list_response(resources, total: records.size, start_index: start_index)
@@ -1343,8 +1342,7 @@ module Authn
       schema = configuration.schemas[id]
       return scim_error(404, "Schema #{id} not found") if schema.nil?
 
-      hash = with_schemas(schema.to_h, ::Scim::Kit::V2::Schemas::SCHEMA)
-      [200, scim_headers, [JSON.pretty_generate(hash)]]
+      [200, scim_headers, [JSON.pretty_generate(schema.to_h)]]
     end
 
     def get_user(request, id)
@@ -1528,17 +1526,7 @@ module Authn
       %(W/"#{time.to_i}")
     end
 
-    def discovery_response(resources, schema)
-      hashes = resources.map { |resource| with_schemas(resource.to_h, schema) }
-      list_response(hashes, total: hashes.size, start_index: 1)
-    end
-
-    def with_schemas(hash, schema)
-      hash["schemas"] ||= [schema]
-      hash
-    end
-
-    def list_response(resources, total:, start_index:)
+    def list_response(resources, total: resources.size, start_index: 1)
       body = {
         schemas: [::Scim::Kit::V2::Messages::LIST_RESPONSE],
         totalResults: total,
