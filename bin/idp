@@ -16,7 +16,7 @@ gemfile do
   gem "rack-session", "~> 2.0"
   gem "rackup", "~> 2.0"
   gem "saml-kit", "1.4.0"
-  gem "scim-kit", "0.8.0"
+  gem "scim-kit", github: "xlgmokha/scim-kit", branch: "cli"
   gem "stringio", "~> 3.0"
   gem "time", "~> 0.1"
   gem "warden", "~> 1.0"
